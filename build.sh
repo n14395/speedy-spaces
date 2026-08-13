@@ -121,6 +121,25 @@ codesign --force --sign "$SIGN" \
 
 echo "==> Built $APP"
 
+# --- DMG for distribution (skip with DMG=0 ./build.sh) ---
+# Contains the app plus an /Applications symlink for drag-to-install. Note: without a
+# Developer ID signature + notarization, downloaders must right-click > Open (or clear
+# the quarantine flag) on first launch — Gatekeeper blocks unnotarized downloads.
+if [ "${DMG:-1}" != "0" ]; then
+    VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo dev)"
+    DMG_PATH="$BUILD/SpeedySpaces-$VERSION.dmg"
+    STAGING="$BUILD/dmg-staging"
+    echo "==> Packaging $DMG_PATH"
+    rm -rf "$STAGING" "$DMG_PATH"
+    mkdir -p "$STAGING"
+    cp -R "$APP" "$STAGING/"
+    ln -s /Applications "$STAGING/Applications"
+    hdiutil create -volname "SpeedySpaces" -srcfolder "$STAGING" \
+        -format UDZO -ov -quiet "$DMG_PATH"
+    rm -rf "$STAGING"
+    echo "==> Built $DMG_PATH"
+fi
+
 # If SpeedySpaces is already running, relaunch so this fresh build takes over. macOS `open` won't
 # relaunch a running LSUIElement agent — it just re-activates the old one — so a rebuild would
 # otherwise keep running stale code. `open -n` forces a new instance; the app terminates the
