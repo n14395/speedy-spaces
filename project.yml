@@ -1,0 +1,36 @@
+# XcodeGen spec. Run `xcodegen generate` to produce SpeedySpaces.xcodeproj,
+# then open in Xcode. (Requires full Xcode; the repo also builds via ./build.sh
+# using only Command Line Tools.)
+name: SpeedySpaces
+options:
+  bundleIdPrefix: com.speedyspaces
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    # Stable signing identity so TCC (Accessibility, Screen Recording, etc.) remembers
+    # grants across rebuilds. Ad-hoc signatures bind the grant to the binary's cdhash,
+    # which changes every build → macOS re-prompts every time. A real Apple Development
+    # cert binds the grant to team+bundle-id instead, which is stable across rebuilds.
+    DEVELOPMENT_TEAM: 4WXBKBCQ42
+    ENABLE_HARDENED_RUNTIME: YES
+targets:
+  SpeedySpaces:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/SpeedySpaces
+      - path: Resources/AppIcon.icns
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.speedyspaces.SpeedySpaces
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SpeedySpaces.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/SpeedySpaces/CGSPrivate.h
+        # Menubar agent, no Dock icon.
+        INFOPLIST_KEY_LSUIElement: YES
