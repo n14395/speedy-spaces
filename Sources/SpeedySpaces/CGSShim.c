@@ -1,5 +1,6 @@
 #include "CGSPrivate.h"
 #include <dlfcn.h>
+#include <string.h>
 
 // SkyLight is already loaded into the process by AppKit at runtime, so its exported
 // CGS* symbols are reachable via RTLD_DEFAULT without an explicit dlopen.
@@ -253,4 +254,69 @@ bool sm_symbolicHotKeyIsEnabled(int hotKey) {
 bool sm_symbolicHotKeySetValue(int hotKey, uint16_t keyChar, uint16_t keyCode, uint32_t modifiers) {
     sm_resolveSymbolicHotKeySymbols();
     return sm_symSetValue ? sm_symSetValue(hotKey, keyChar, keyCode, modifiers) == 0 : false;
+}
+
+// --- SLS per-window notifications (Mission Control replay engine) -----------
+// Callback signature per the community-known ABI (yabai/JankyBorders lineage),
+// verified live on macOS 27.0 26A5406e via probe/mcprobe.m: the payload's first
+// 4 bytes are the window id for the 8xx window events.
+typedef void (*SLSConnNotifyProc)(uint32_t type, void *data, size_t len, void *ctx, int cid);
+typedef CGError (*RegisterConnNotifyFn)(CGSConnectionID, SLSConnNotifyProc, uint32_t, void *);
+typedef CGError (*RequestWinNotifsFn)(CGSConnectionID, uint32_t *, int);
+
+static RegisterConnNotifyFn sm_resolveRegisterConnNotify(void) {
+    static RegisterConnNotifyFn fn = NULL; static int resolved = 0;
+    if (!resolved) {
+        fn = (RegisterConnNotifyFn)dlsym(RTLD_DEFAULT, "SLSRegisterConnectionNotifyProc");
+        resolved = 1;
+    }
+    return fn;
+}
+
+static RequestWinNotifsFn sm_resolveRequestWinNotifs(void) {
+    static RequestWinNotifsFn fn = NULL; static int resolved = 0;
+    if (!resolved) {
+        fn = (RequestWinNotifsFn)dlsym(RTLD_DEFAULT, "SLSRequestNotificationsForWindows");
+        resolved = 1;
+    }
+    return fn;
+}
+
+bool sm_slsWindowEventsAvailable(void) {
+    return sm_resolveRegisterConnNotify() != NULL && sm_resolveRequestWinNotifs() != NULL;
+}
+
+static sm_slsWindowEventCallback sm_winEvtCb = NULL;
+
+static void sm_connNotifyTrampoline(uint32_t type, void *data, size_t len, void *ctx, int cid) {
+    (void)ctx; (void)cid;
+    uint32_t wid = 0;
+    if (data && len >= 4) memcpy(&wid, data, 4);
+    sm_slsWindowEventCallback cb = sm_winEvtCb;
+    if (cb) cb(type, wid);
+}
+
+bool sm_slsWindowEventsStart(sm_slsWindowEventCallback cb) {
+    RegisterConnNotifyFn reg = sm_resolveRegisterConnNotify();
+    if (!reg || !sm_resolveRequestWinNotifs()) return false;
+    sm_winEvtCb = cb;
+    static int registered = 0;
+    if (registered) return true;
+    // 811 create · 806 moved · 807 resized · 804 destroyed · 816 commit (observed only
+    // at window teardown on this OS — an early close-confirm signal). Registration is
+    // process-lifetime; delivery is gated by what sm_slsSubscribeWindowNotifications
+    // asks for (811 is connection-wide once any subscription exists).
+    static const uint32_t types[] = {804, 806, 807, 811, 816};
+    bool ok = true;
+    CGSConnectionID cid = sm_mainConnectionID();
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+        ok = reg(cid, sm_connNotifyTrampoline, types[i], NULL) == 0 && ok;
+    registered = ok;
+    return ok;
+}
+
+bool sm_slsSubscribeWindowNotifications(const uint32_t *wids, int count) {
+    RequestWinNotifsFn fn = sm_resolveRequestWinNotifs();
+    if (!fn || !wids || count <= 0) return false;
+    return fn(sm_mainConnectionID(), (uint32_t *)wids, count) == 0;
 }

@@ -5,12 +5,20 @@ import QuartzCore
 /// Control is open. One shield-level, click-through overlay window per display. No SIP, no
 /// injection, no Accessibility.
 ///
-/// Pipeline: a slow idle poll (`CGWindowListCopyWindowInfo`) detects the spaces bar by
-/// LAYER + GEOMETRY and caches the bar/tile window IDs ("discovery"); while the bar is up, a
-/// CADisplayLink samples just those windows' bounds each frame (cheap) and feeds per-label
-/// spring animators, so labels glide at display refresh rate instead of snapping at the poll
-/// rate. When geometry has been still for a while the link pauses and a 10 Hz timer watches
-/// for change ("settled"). Tile index → space is left-to-right = ordinal order per display.
+/// Pipeline (macOS 27 "replay" architecture — see fix-workspace-lag.md, probe/mcprobe.m):
+/// WindowManager animates Mission Control inside its own Core Animation — tile WINDOW
+/// bounds never interpolate at the window-server level; they snap once per layout commit,
+/// and each commit announces itself as an SLS 806/807 notification burst carrying the
+/// FINAL bounds a few hundred ms before the visible glide completes. So chasing sampled
+/// bounds per frame can only trail; instead the engine listens for those events (811
+/// births arm discovery, 806/807 commits retarget) and REPLAYS the native glide open-loop
+/// on a matched critically damped spring, moving in sync with the tiles by construction.
+/// A slow idle poll (`CGWindowListCopyWindowInfo`) still detects the spaces bar by LAYER +
+/// GEOMETRY and caches the bar/tile window IDs ("discovery"); it doubles as the fallback
+/// cadence — if the private notification surface ever vanishes, the engine degrades to
+/// the old per-frame sampling chase instead of breaking. The CADisplayLink runs only
+/// while label springs are in motion. Tile index → space is left-to-right = ordinal
+/// order per display.
 ///
 /// Names show only while the thumbnails are revealed (the expanded bar). Each label is bold
 /// text on a transparent background, placed ABOVE its thumbnail; Apple's "Desktop N" number
@@ -68,7 +76,7 @@ final class MissionControlOverlay: NSObject {
     // Window-server state is only an early dismissal signal for Dock-notification
     // dismissals; for user input (Esc, ⌃↑, clicks, the three-finger swipe down) the
     // bar/tile windows stay "onscreen" until well AFTER the exit animation (measured),
-    // far too late for the fly-off. So while MC is open a LISTEN-ONLY event tap watches
+    // far too late for the exit fade. So while MC is open a LISTEN-ONLY event tap watches
     // for inputs that begin a dismissal and launches the label exit immediately; the
     // sampling path remains the truth for actually closing (and quietly rebuilds the
     // labels if MC turns out to still be open).
@@ -102,7 +110,7 @@ final class MissionControlOverlay: NSObject {
     // Vertical dock-swipe watcher (the three-finger swipe-down close) — tap-thread-confined.
     private var vswipeActive = false                 // a vertical gesture is being tracked
     private var vswipeLow = 0.0                      // lowest progress seen this gesture
-    private var vswipeFired = false                  // fly-off already launched for this gesture
+    private var vswipeFired = false                  // exit fade already launched for this gesture
     private var vswipeLastBump: CFTimeInterval = 0   // keepalive throttle
     private var vswipeLogged = 0                     // debug shape-capture budget per session
     private var unchangedDiscoveries = 0
@@ -121,13 +129,28 @@ final class MissionControlOverlay: NSObject {
         return unchangedDiscoveries >= 2 ? safetyRescanInterval : rediscoveryInterval
     }
 
+    // MARK: - SLS event path (primary geometry trigger on macOS 27)
+
+    /// True once the SLS per-window notification surface is registered. Events arrive on
+    /// the main thread via the app's event loop (delivery rides the CGS event stream).
+    private var eventsArmed = false
+    /// Set by an 806/807 arrival; consumed by the next frame(), which retargets the
+    /// labels with the native REPLAY spring instead of the fallback pursuit/layout ones.
+    private var replayCommit = false
+    /// Coalesces an event burst (one event per tile within ~1 ms at a relayout commit)
+    /// into a single frame() on the next run-loop turn.
+    private var framePending = false
+    /// Rate limit for 811-triggered probes while closed (811 fires for EVERY window
+    /// born in the session, not just Mission Control's).
+    private var lastEventProbe: CFTimeInterval = 0
+
     /// Geometry sampler. Default: the public description path — besides bounds it carries
     /// kCGWindowIsOnscreen, which is the ONLY early Mission-Control-dismissal signal
     /// (measured: tiles go !onscreen ~30 ms into the exit and the bar follows, while
     /// SLSGetWindowBounds keeps answering with stale bounds until well after the exit
     /// animation finishes). MCO_SLS=1 opts into the allocation-free private sampler for
-    /// benchmarking; it costs late dismissal detection (the fly-off exit degrades to an
-    /// after-the-fact fade).
+    /// benchmarking; it costs late dismissal detection (the exit fade
+    /// launches after the fact instead of at the trigger).
     private let useSLS = sm_getWindowBoundsAvailable()
         && ProcessInfo.processInfo.environment["MCO_SLS"] != nil
 
@@ -221,7 +244,7 @@ final class MissionControlOverlay: NSObject {
     @objc private func spaceChanged() {
         guard phase != .closed else { return }
         // A space switch normally means a switch-and-dismiss — but switching WHILE Mission
-        // Control stays open (⌃-arrow / number key) must not launch the fly-off: the labels
+        // Control stays open (⌃-arrow / number key) must not launch the exit fade: the labels
         // stay put (parked on their sticky space) and just restyle in place. The bar is still on
         // screen in that case, so treat a switch as a dismissal only once the bar is gone. The
         // AX teardown watch is the primary detector when live; this is the no-Accessibility
@@ -241,7 +264,11 @@ final class MissionControlOverlay: NSObject {
     func start() {
         guard enabled, timer == nil, link == nil else { return }
         phase = .closed
-        dbg("engine started (policy=\(NSApp.activationPolicy().rawValue), sampler=\(useSLS ? "SLS" : "CGDescription"))")
+        if !eventsArmed, sm_slsWindowEventsAvailable() {
+            MCOEventBridge.overlay = self
+            eventsArmed = sm_slsWindowEventsStart(mcoSLSEventTrampoline)
+        }
+        dbg("engine started (policy=\(NSApp.activationPolicy().rawValue), sampler=\(useSLS ? "SLS" : "CGDescription"), events=\(eventsArmed))")
         scheduleTimer(idleInterval, tolerance: 0.03)
     }
 
@@ -277,7 +304,7 @@ final class MissionControlOverlay: NSObject {
     }
 
     /// The app itself is closing Mission Control (e.g. the native hold chord released) — start
-    /// the labels' fly-off now so it rides the close animation instead of trailing it. The
+    /// the labels' exit fade now so it lands with the native fade instead of trailing it. The
     /// window-state/AX teardown that would otherwise trigger this fires only once the close
     /// animation has finished; this beats it to the start.
     @objc private func mcWillClose() {
@@ -322,11 +349,17 @@ final class MissionControlOverlay: NSObject {
     private func enterSettled() {
         phase = .settled
         link?.isPaused = true
+        // The tight watch stays even with the event path armed: geometry changes
+        // announce themselves (806/807/811/804/816), but DISMISSALS often don't — a
+        // keyboard close on an un-AX-trusted build has no tap signal and its first
+        // event (804) arrives ~0.5 s in, which left labels floating over the restored
+        // desktop (measured from the 2026-08-14 screen recording, when this watch
+        // briefly ran at 1 s). 20 Hz × describeWindows on ~14 wids is cheap.
         scheduleTimer(settledInterval, tolerance: 0.01)
         dbg("settled (link paused)")
     }
 
-    private func close(flyOff: Bool) {
+    private func close(dismissing: Bool) {
         guard phase != .closed else { return }
         phase = .closed
         // Listeners outside the overlay (the switcher HUD) key off MC visibility too.
@@ -348,7 +381,7 @@ final class MissionControlOverlay: NSObject {
         }
         let now = CACurrentMediaTime()
         for w in overlays.values {
-            if flyOff { w.exitUpward() } else { w.update(labels: nil, now: now) }
+            if dismissing { w.exitDismiss() } else { w.update(labels: nil, now: now) }
         }
         scheduleTimer(idleInterval, tolerance: 0.03)
         if statN > 0 {
@@ -378,6 +411,65 @@ final class MissionControlOverlay: NSObject {
         } else if burstUntil > 0, now >= burstUntil {
             burstUntil = 0
             scheduleTimer(idleInterval, tolerance: 0.03)
+        }
+    }
+
+    // MARK: - SLS event arrivals (main thread, via the app's event loop)
+
+    /// 811 create · 806 moved · 807 resized · 804 destroyed. 806/807 fire once per
+    /// layout commit with the FINAL bounds already readable — that's the replay trigger.
+    /// Tiles are BORN at final bounds on hover-expand (811 with no follow-up move), so
+    /// births prompt rediscovery rather than waiting for a move that never comes.
+    fileprivate func handleSLSEvent(type: UInt32, wid: UInt32) {
+        guard enabled else { return }
+        let now = CACurrentMediaTime()
+        switch type {
+        case 811 where phase == .closed:
+            // Some window was born session-wide — cheap rate-limited probe, so external
+            // MC opens (F3 / hot corner / swipe) are caught near-instantly instead of at
+            // the idle poll's cadence.
+            if now - lastEventProbe >= 0.12 { lastEventProbe = now; probe() }
+        case 811:
+            unchangedDiscoveries = 0
+            needsRediscovery = true
+            kickFrame()
+        case 806, 807:
+            guard phase != .closed, tileIDs.contains(wid) || barIDs.contains(wid) else { return }
+            replayCommit = true
+            kickFrame()
+        case 804, 816:
+            // A tracked window died (804) or committed its teardown (816, observed only
+            // at window death on this OS) — usually the dismissal. Confirm through the
+            // ordinary frame path now rather than at the settled watch's cadence.
+            guard phase != .closed, tileIDs.contains(wid) || barIDs.contains(wid) else { return }
+            needsRediscovery = true
+            kickFrame()
+        default:
+            break
+        }
+    }
+
+    /// One frame() per run-loop turn, no matter how many events land in a burst.
+    private func kickFrame() {
+        guard !framePending else { return }
+        framePending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.framePending = false
+            guard self.phase != .closed else { return }
+            self.frame(now: CACurrentMediaTime(), dt: 0, stepSprings: false)
+        }
+    }
+
+    /// (Re)request per-window notifications for the current bar+tile set. Stale wids in
+    /// an earlier request are inert, so the fresh list goes out whenever the set changes
+    /// (wids are new every Mission Control session).
+    private func subscribeWindowNotifications() {
+        guard eventsArmed else { return }
+        var wids = barIDs + tileIDs
+        guard !wids.isEmpty else { return }
+        if !sm_slsSubscribeWindowNotifications(&wids, Int32(wids.count)) {
+            dbg("SLS window subscription failed (\(wids.count) wids)")
         }
     }
 
@@ -487,6 +579,12 @@ final class MissionControlOverlay: NSObject {
         case .leftMouseDown:
             dismissDownLocation = event.location
             mouseHeld.set(true)
+            // A drag may follow — wake the frame-rate chase so shifting tiles are
+            // followed live instead of at the settled watch's cadence.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.phase == .settled else { return }
+                self.enterTracking()
+            }
         case .leftMouseUp:
             mouseHeld.set(false)
             // A CLICK (not a drag — tile drags reorder without dismissing) dismisses when it
@@ -520,7 +618,7 @@ final class MissionControlOverlay: NSObject {
             } else if gates.tileRects.contains(where: { $0.insetBy(dx: -4, dy: -4).contains(loc) }) {
                 // The delete "×" sits at a tile's top-left corner — clicking it REMOVES
                 // that desktop (MC stays open, tiles rearrange) rather than dismissing,
-                // so a click near ANY tile's top-left corner must not launch the fly-off.
+                // so a click near ANY tile's top-left corner must not launch the exit fade.
                 // A genuine switch-click landing in that corner still dismisses via the
                 // AX teardown a few frames later.
                 let nearDeleteButton = gates.tileRects.contains {
@@ -591,7 +689,7 @@ final class MissionControlOverlay: NSObject {
     /// while the bar slid up. Real dock-swipe gestures ARE delivered to this tap (type-30
     /// events with the classic gesture fields populated — but ONLY to an ACTIVE tap;
     /// listen-only taps get none of them on this OS), so watch vertical dock swipes and
-    /// launch the fly-off the moment one pulls meaningfully downward (see vswipeStep). A
+    /// launch the exit fade the moment one pulls meaningfully downward (see vswipeStep). A
     /// false fire self-heals: forced close → the 0.15 s idle probe re-detects MC → labels
     /// re-reveal.
     private func classifyGestureEvent(_ event: CGEvent) {
@@ -639,7 +737,7 @@ final class MissionControlOverlay: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let self, self.phase != .closed, self.dismissalAt == now else { return }
             self.dbg("swipe close-confirm timeout — forcing closed")
-            self.close(flyOff: true)
+            self.close(dismissing: true)
         }
     }
 
@@ -679,16 +777,17 @@ final class MissionControlOverlay: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { callback?(uuid, screen) }
     }
 
-    /// Fly the labels off right away; sampling stays live and either confirms the close
-    /// (which finds nothing left to animate) or, if MC didn't actually dismiss, rebuilds
-    /// the labels after the suppression window and fades them back in.
+    /// Start the labels' exit fade right away (the native exit is an in-place fade that
+    /// completes within ~70 ms of the trigger); sampling stays live and either confirms
+    /// the close (which finds nothing left to animate) or, if MC didn't actually
+    /// dismiss, rebuilds the labels after the suppression window and fades them back in.
     private func dismissalInitiated(_ how: String) {
         guard phase != .closed else { return }
         let now = CACurrentMediaTime()
         guard now - dismissalAt > 1.0 else { return }
         dismissalAt = now
-        dbg("dismissal initiated (\(how)) — labels fly off")
-        for w in overlays.values { w.exitUpward() }
+        dbg("dismissal initiated (\(how)) — labels fade out")
+        for w in overlays.values { w.exitDismiss() }
         // Don't wait out the window-state confirmation (measured 0.7–1 s, occasionally
         // longer — long enough for the 1 s update-suppression to lapse and REBUILD the
         // labels over an empty desktop, which then die by the old in-place fade). The
@@ -697,7 +796,7 @@ final class MissionControlOverlay: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, self.phase != .closed, self.dismissalAt == now else { return }
             self.dbg("dismissal close-confirm timeout — forcing closed")
-            self.close(flyOff: true)   // labels already flew; nothing left to animate
+            self.close(dismissing: true)   // labels already faded; nothing left to animate
         }
     }
 
@@ -777,7 +876,7 @@ final class MissionControlOverlay: NSObject {
         // closing. The tiles STAY put through that re-render but vanish first on a genuine
         // dismissal (~30 ms before the bar), so they're the discriminator: tiles still on
         // screen ⇒ re-render ⇒ re-attach and leave the labels standing; tiles gone ⇒ real
-        // teardown ⇒ fly off now (no waiting for the bar, which lingers).
+        // teardown ⇒ fade out now (no waiting for the bar, which lingers).
         stopAXWatch()
         if NativeBarWindows.tilesOnScreen() {
             dbg("AX element destroyed but tiles still on screen — re-arming (in-place switch)")
@@ -838,9 +937,10 @@ final class MissionControlOverlay: NSObject {
             unchangedDiscoveries += 1
         } else {
             unchangedDiscoveries = 0
+            barIDs = bars
+            tileIDs = tiles
+            subscribeWindowNotifications()
         }
-        barIDs = bars
-        tileIDs = tiles
         return sawBar
     }
 
@@ -869,6 +969,15 @@ final class MissionControlOverlay: NSObject {
         check(pos.isFinite && vel.isFinite, "spring: no NaN/Inf")
         let idle = OverlayWindow.springStep(pos: 42, vel: -3, target: 0, tau: 0.08, dt: 0)
         check(idle.pos == 42 && idle.vel == -3, "spring: dt=0 is identity")
+        // Replay spring: τ=0.12 reproduces the measured native relayout glide
+        // (CASpringAnimation mass 1, stiffness 278, damping 33.3 — critically damped,
+        // ω≈16.7/s): a 765 pt hop from rest lands within ~4 pt at the measured 459 ms
+        // settle point (fix-workspace-lag.md).
+        var rpos: CGFloat = 765, rvel: CGFloat = 0
+        for _ in 0..<55 {   // 55 × 1/120 s ≈ 458 ms
+            (rpos, rvel) = OverlayWindow.springStep(pos: rpos, vel: rvel, target: 0, tau: 0.12, dt: 1.0 / 120)
+        }
+        check(abs(rpos) < 4.5, "replay spring: 765 pt lands within ~4 pt at native settle time")
         // Vertical dock-swipe (three-finger close) watcher decisions.
         var v = vswipeStep(phase: 1, progress: 0.004, active: false, low: 9, fired: false)
         check(v.active && !v.fired && !v.fire && v.low == 0.004, "vswipe: began arms and seeds the low-water mark")
@@ -901,7 +1010,7 @@ final class MissionControlOverlay: NSObject {
     // MARK: - Sampling (bounds of the cached windows only; every frame)
 
     /// `barsOnScreen` counts bar windows still alive and on-screen REGARDLESS of size band —
-    /// zero means Mission Control itself is going (fly-off); non-zero with `bars` empty means
+    /// zero means Mission Control itself is going (exit fade); non-zero with `bars` empty means
     /// the bar merely collapsed/left its band (fade). Judged from live sampling, never from
     /// the discovery ID cache, which can lag the screen by a scan.
     private func sample() -> (bars: [NSRect], tiles: [(wid: CGWindowID, rect: NSRect)],
@@ -999,7 +1108,7 @@ final class MissionControlOverlay: NSObject {
             // No bar windows on screen at all => Mission Control itself is dismissing and
             // the tiles are flying up — ride with them. A bar window that's still on screen
             // but collapsed/out of band is not a dismissal — plain fade.
-            close(flyOff: s.barsOnScreen == 0)
+            close(dismissing: s.barsOnScreen == 0)
             return
         }
         // Bar bottom + tile rects in CG coords (undo the NS flip) for the tap thread's
@@ -1024,6 +1133,13 @@ final class MissionControlOverlay: NSObject {
 
         let byScreen = mapLabels(bars: s.bars, tiles: s.tiles, now: now, tilesAtRest: tilesStill)
 
+        // An 806/807 commit kicked this frame: the sampled targets are the FINAL bounds
+        // of a native relayout whose visible glide is just starting — retarget with the
+        // matched replay spring so the labels play the same curve from the same instant.
+        let replay = replayCommit
+        replayCommit = false
+        if replay { dbg("replay commit — retargeting on the native curve") }
+
         var anyMoving = false
         // After an input-side dismissal the labels have already flown; don't rebuild them
         // while the (slow) window-state close confirmation is pending. If MC turns out to
@@ -1046,7 +1162,7 @@ final class MissionControlOverlay: NSObject {
                     BarLabel(id: $0.id, center: NSPoint(x: $0.center.x - o.x, y: $0.center.y - o.y),
                              name: $0.name, icon: $0.icon, contentKey: $0.contentKey,
                              placeholderWidth: $0.placeholderWidth)
-                }, now: now)
+                }, now: now, replay: replay)
                 if stepSprings {
                     if w.step(dt: dt) { anyMoving = true }
                 } else if w.needsMotion {
@@ -1078,7 +1194,11 @@ final class MissionControlOverlay: NSObject {
             needsRediscovery = true
         }
         if phase == .tracking {
-            stableFrames = tilesStill && !anyMoving ? stableFrames + 1 : 0
+            // Never settle while the left button is down: a tile reorder or window drag
+            // moves the bar's geometry continuously without reliable commit events (the
+            // tile shift under a window drag trailed by half a tile in the 2026-08-14
+            // recording once the engine had settled) — keep chasing at frame rate.
+            stableFrames = tilesStill && !anyMoving && !mouseHeld.get() ? stableFrames + 1 : 0
             if stableFrames >= settleAfterFrames { enterSettled() }
         } else if phase == .settled, !tilesStill || anyMoving {
             enterTracking()
@@ -1287,6 +1407,18 @@ final class MissionControlOverlay: NSObject {
     }
 }
 
+/// Static bridge for the C event callback (a @convention(c) function can't capture
+/// context). One overlay engine exists per app; `start()` points this at it.
+private enum MCOEventBridge {
+    static weak var overlay: MissionControlOverlay?
+}
+
+/// C-convention trampoline handed to sm_slsWindowEventsStart. Arrives on the main
+/// thread (delivery rides the CGS event stream through the app's event loop).
+private func mcoSLSEventTrampoline(type: UInt32, wid: UInt32) {
+    MCOEventBridge.overlay?.handleSLSEvent(type: type, wid: wid)
+}
+
 extension NSScreen {
     var displayID: CGDirectDisplayID? {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
@@ -1363,8 +1495,9 @@ fileprivate struct BarLabel {
 /// `update`; `step` advances a critically damped spring per label each display-link frame, so
 /// motion is refresh-rate smooth no matter how the sampled geometry moves. Labels reveal with
 /// a fade once their targets have held still briefly (hard max-wait so the reveal can never
-/// get stuck). On exit they fade in place when the bar merely collapses, but ride up
-/// off-screen with the departing tiles when Mission Control itself dismisses (`exitUpward`).
+/// get stuck). On exit they always fade in place — gently when the bar merely collapses,
+/// and near-instantly when Mission Control itself dismisses (`exitDismiss`), matching the
+/// native exit on macOS 27, which fades without moving the tiles.
 private final class OverlayWindow: NSPanel {
     /// Diagnostics hook: (labelCount, msSinceExpand) at reveal, wired to the engine's dbg log.
     static var onReveal: ((Int, Int) -> Void)?
@@ -1376,7 +1509,6 @@ private final class OverlayWindow: NSPanel {
         var text: String
         var pos: CGPoint          // animated center (window-local)
         var vel: CGPoint = .zero
-        var sv: CGPoint = .zero   // smoothed sample velocity, for optional pursuit lead
         var target: CGPoint
         var tau: CGFloat
         var settled = true
@@ -1398,27 +1530,25 @@ private final class OverlayWindow: NSPanel {
     private var expandedSince: CFTimeInterval?
     private var emptySince: CFTimeInterval?
     private var unstableAt: CFTimeInterval = 0
-    private var lastUpdate: CFTimeInterval = 0
     private var fadeGen = 0
 
-    // Motion tuning. τ (smoothTime) is the spring's characteristic time: ~0.08 s for pursuit
-    // of continuously-moving geometry, ~0.20 s for one-shot layout jumps (space add/remove),
-    // which reads like Mission Control's own glide. A one-sample target jump ≥ `layoutJump`
-    // points is treated as a layout change even when the label set didn't change (adding an
-    // UNNAMED space shifts every named neighbor without changing the set).
+    // Motion tuning. τ is the critically damped spring's characteristic time (ω = 2/τ in
+    // springStep's parameterization). tauReplay plays back a native relayout: 0.12
+    // matches the measured WindowManager glide — CASpringAnimation(mass: 1, stiffness:
+    // 278, damping: 33.3), critically damped at ω ≈ 16.7/s, landing a 765 pt hop within
+    // ~4 pt at the measured 459 ms settle (fix-workspace-lag.md). It serves both
+    // event-marked commits and any sampled jump ≥ `layoutJump` points (a relayout the
+    // sampler discovered on its own — commits don't kick reliably during drags; note a
+    // jump can move every label without changing the label set, e.g. adding an UNNAMED
+    // space shifts every named neighbor). tauPursuit chases continuously-moving sampled
+    // geometry: drag shifts, and the whole-engine fallback if the notification surface
+    // ever vanishes.
+    private let tauReplay: CGFloat = 0.12
     private let tauPursuit: CGFloat = 0.08
-    private let tauLayout: CGFloat = 0.20
     /// Launch entrance: a much tighter τ than pursuit so the half-screen drop-in arrives
     /// snappily rather than floating down on the spring's slow tail.
     private let tauLaunch: CGFloat = 0.045
     private let layoutJump: CGFloat = 30
-    /// Pursuit lead in multiples of τ: a critically damped spring lags a ramp by τ·v, visible
-    /// against Apple's own caption below. Measured (add/delete-desktop rearranges): the window
-    /// server DOES report live interpolated tile bounds — ~570 pt/s glides, which at τ=0.08
-    /// means ~45 pt of trail without lead. 1 cancels ramp lag exactly. Lead applies only in
-    /// pursuit mode: a layout JUMP spikes the one-sample velocity estimate and would overshoot.
-    private let leadFactor: CGFloat = 1
-    private let leadClamp: CGFloat = 60
 
     // Reveal gating (time-based, measured on sampled targets — never on animated positions).
     // Small non-zero: hold the reveal until the bar has stopped moving, so the drop-in
@@ -1469,13 +1599,15 @@ private final class OverlayWindow: NSPanel {
     }
 
     /// `nil` or empty => collapsed / MC closed: fade out and clear. Non-empty => expanded:
-    /// diff against the shown labels by space uuid and retarget the springs.
-    func update(labels: [BarLabel]?, now: CFTimeInterval) {
+    /// diff against the shown labels by space uuid and retarget the springs. `replay`
+    /// marks targets that came from an 806/807 relayout commit — those launch the
+    /// native-matched replay spring rather than the fallback pursuit/layout ones.
+    func update(labels: [BarLabel]?, now: CFTimeInterval, replay: Bool = false) {
         guard let labels, !labels.isEmpty else {
             guard expandedSince != nil || !items.isEmpty else { emptySince = nil; return }
             // Grace period: every tile vanishing at once is how MC dismissal BEGINS (the
             // bar follows ~30 ms later, and the AX-teardown trigger can take ~150 ms) —
-            // hold long enough for the fly-off exit to win over this in-place fade.
+            // hold long enough for the dismissal exit fade to win over this slower one.
             if let since = emptySince {
                 if now - since >= 0.25 { emptySince = nil; fadeOutAndClear() }
             } else {
@@ -1484,8 +1616,6 @@ private final class OverlayWindow: NSPanel {
             return
         }
         emptySince = nil
-        let sdt = min(max(now - lastUpdate, 1.0 / 240), 0.25)
-        lastUpdate = now
         if expandedSince == nil {
             // Fresh expand: cancel any in-flight fade-out teardown and start clean.
             fadeGen += 1
@@ -1505,9 +1635,12 @@ private final class OverlayWindow: NSPanel {
                 let d = (dx * dx + dy * dy).squareRoot()
                 maxDrift = max(maxDrift, d)
                 it.target = l.center
-                let raw = CGPoint(x: dx / sdt, y: dy / sdt)
-                it.sv = CGPoint(x: it.sv.x * 0.7 + raw.x * 0.3, y: it.sv.y * 0.7 + raw.y * 0.3)
-                if d >= layoutJump { it.tau = tauLayout }
+                if (replay && d > 0.5) || d >= layoutJump {
+                    // The tile itself starts gliding here on the native spring right
+                    // about now — play the same curve. Velocity carries over so a
+                    // commit landing mid-flight retargets without a hitch.
+                    it.tau = tauReplay
+                }
                 if d > 0.01 { it.settled = false }
                 if it.text != l.contentKey { retext(it, l) }
             } else {
@@ -1520,10 +1653,8 @@ private final class OverlayWindow: NSPanel {
             changedSet = true
             removeItem(items.removeValue(forKey: id)!)
         }
-        // NOTE: a changed label set does NOT force layout-mode τ onto items in motion:
-        // add/delete rearranges stream live interpolated bounds (measured), and the tight
-        // pursuit τ + lead is what keeps labels riding their thumbnails through them.
-        // Layout-mode τ is reserved for genuine one-sample jumps (d ≥ layoutJump).
+        // NOTE: a changed label set does NOT force a τ change onto items already in
+        // motion — a mid-flight add/remove just retargets whatever spring is playing.
 
         if maxDrift >= stabilityEps || changedSet { unstableAt = now }
         if !revealed, let since = expandedSince,
@@ -1568,16 +1699,8 @@ private final class OverlayWindow: NSPanel {
         guard dt > 0 else { return needsMotion }
         var moving = false
         for it in items.values where !it.settled {
-            var tx = it.target.x, ty = it.target.y
-            if leadFactor > 0, it.tau == tauPursuit {
-                let lead = it.tau * leadFactor
-                var lx = it.sv.x * lead, ly = it.sv.y * lead
-                let mag = (lx * lx + ly * ly).squareRoot()
-                if mag > leadClamp { lx *= leadClamp / mag; ly *= leadClamp / mag }
-                tx += lx; ty += ly
-            }
-            let sx = Self.springStep(pos: it.pos.x, vel: it.vel.x, target: tx, tau: it.tau, dt: dt)
-            let sy = Self.springStep(pos: it.pos.y, vel: it.vel.y, target: ty, tau: it.tau, dt: dt)
+            let sx = Self.springStep(pos: it.pos.x, vel: it.vel.x, target: it.target.x, tau: it.tau, dt: dt)
+            let sy = Self.springStep(pos: it.pos.y, vel: it.vel.y, target: it.target.y, tau: it.tau, dt: dt)
             it.pos.x = sx.pos; it.vel.x = sx.vel
             it.pos.y = sy.pos; it.vel.y = sy.vel
 
@@ -1696,33 +1819,21 @@ private final class OverlayWindow: NSPanel {
         })
     }
 
-    /// Mission Control is dismissing: the tiles fly up off the top edge, and their windows
-    /// are already destroyed (no bounds to track), so the labels ride a synthesized version
-    /// of that motion — an ease-in launch off the top of the screen plus a fade. Close is
-    /// detected within a frame or two, so the launch starts from where the tiles were.
-    func exitUpward() {
+    /// Mission Control is dismissing. The native exit on macOS 27 is an in-place fade
+    /// completing in ≤67 ms — the tiles do not move (measured; the old fly-up exit no
+    /// longer exists on this OS, see fix-workspace-lag.md). Match it: a fast fade with
+    /// zero motion. Erring early reads as native; a late fade lingers over the desktop.
+    func exitDismiss() {
         emptySince = nil
-        guard !items.isEmpty else {
-            if expandedSince != nil || revealed { fadeOutAndClear() }
-            return
-        }
+        guard !items.isEmpty || expandedSince != nil || revealed else { return }
         revealed = false
         expandedSince = nil
-        let fields = items.values.map(\.field)
         items.removeAll()
         fadeGen += 1
         let gen = fadeGen
-        let lowest = fields.map { $0.frame.minY }.min() ?? frame.height
-        let travel = frame.height - lowest + 12   // clears the top edge with a small margin
         NSAnimationContext.runAnimationGroup({ ctx in
-            // MC's own exit clears the screen in ~0.2 s (measured from a mid-exit frame
-            // capture) — matching it keeps the labels from trailing the departed tiles.
-            ctx.duration = 0.2
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            ctx.allowsImplicitAnimation = true
-            for f in fields {
-                f.animator().setFrameOrigin(NSPoint(x: f.frame.origin.x, y: f.frame.origin.y + travel))
-            }
+            ctx.duration = 0.07
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             container.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             guard let self, gen == self.fadeGen else { return }

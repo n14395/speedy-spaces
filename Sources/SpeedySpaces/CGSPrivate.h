@@ -85,4 +85,20 @@ bool sm_symbolicHotKeySetValue(int hotKey, uint16_t keyChar, uint16_t keyCode, u
 bool sm_getWindowBounds(uint32_t wid, CGRect *outBounds);
 bool sm_getWindowBoundsAvailable(void);
 
+// --- SLS per-window notifications (Mission Control replay engine) ----------
+// The window server pushes per-window events to a registered connection notify proc:
+// 811 create, 806 moved / 807 resized (fired once per layout commit, AFTER the final
+// bounds are readable — WindowManager's visible glide plays later, inside its own CA),
+// 804 destroyed. Delivery rides the CGS event stream, so it only works in a process
+// running a real AppKit event loop ([NSApp run]); callbacks arrive on the MAIN thread.
+// Measured on macOS 27.0 26A5406e — see fix-workspace-lag.md and probe/mcprobe.m.
+typedef void (*sm_slsWindowEventCallback)(uint32_t type, uint32_t wid);
+bool sm_slsWindowEventsAvailable(void);
+// Register `cb` for the event types above. Idempotent per process (subsequent calls
+// just replace the callback). Returns false if the symbols are gone on this OS.
+bool sm_slsWindowEventsStart(sm_slsWindowEventCallback cb);
+// Ask for notifications about these specific windows. Stale wids are inert, so the
+// full fresh list must be re-requested whenever the tracked window set changes.
+bool sm_slsSubscribeWindowNotifications(const uint32_t *wids, int count);
+
 #endif /* CGSPRIVATE_H */
