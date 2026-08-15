@@ -222,10 +222,11 @@ enum Prefs {
 
     // MARK: - Menu bar item composition
     //
-    // The menubar item is a strip of one or more segments. `showIcon`/`showName` control how the
-    // *current* space is drawn; `showSwitcher` adds a clickable numbered square per space on the
-    // focused display (the current space's square is replaced by its icon/name when those are on).
-    // If all three are off the item falls back to a plain grid icon that opens the menu.
+    // The menubar item is a strip of one or more segments. `showIcon`/`showName`/`showNumber`
+    // control how the *current* space is drawn; `showSwitcher` adds a clickable numbered square
+    // per space on the focused display (the current space's square is replaced by its
+    // icon/name/number when those are on). If all are off the item falls back to a plain grid
+    // icon that opens the menu.
 
     static var menuBarShowIcon: Bool {
         get { defaults.object(forKey: "menuBarShowIcon") as? Bool ?? true }
@@ -239,6 +240,16 @@ enum Prefs {
         get { defaults.object(forKey: "menuBarShowName") as? Bool ?? true }
         set {
             defaults.set(newValue, forKey: "menuBarShowName")
+            NotificationCenter.default.post(name: .speedySpacesPrefsChanged, object: nil)
+        }
+    }
+
+    /// Show the current space's number (1-based position on its display) in the menu bar
+    /// segment, before the name when both are on ("3 · Media").
+    static var menuBarShowNumber: Bool {
+        get { defaults.object(forKey: "menuBarShowNumber") as? Bool ?? false }
+        set {
+            defaults.set(newValue, forKey: "menuBarShowNumber")
             NotificationCenter.default.post(name: .speedySpacesPrefsChanged, object: nil)
         }
     }

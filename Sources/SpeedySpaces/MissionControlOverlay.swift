@@ -1878,7 +1878,14 @@ private final class OverlayWindow: NSPanel {
         }
         let out = NSMutableAttributedString()
         if let icon = l.icon {
-            let image = icon.isTemplate ? tinted(icon, color: .white) : icon
+            var image = icon.isTemplate ? tinted(icon, color: .white) : icon
+            // The centered-on-thumbnail icon (`.largeOver`) rides on a translucent dark
+            // circle so it reads against any wallpaper thumbnail instead of blending in.
+            // The other styles sit above the tile on the dimmed backdrop and stay bare.
+            // Badge size is occlusion-safe: 11 filled 40 pt circles over the tiles did
+            // NOT trip WindowManager's compositing abort (mission-control-labels.md
+            // addendum) — keep the badge in this size class if it ever grows.
+            if l.id.hasSuffix(mcIconLabelSuffix) { image = IconRendering.circleBadged(image) }
             let attachment = NSTextAttachment()
             attachment.image = image
             // Center the icon on the text's cap-height midline.

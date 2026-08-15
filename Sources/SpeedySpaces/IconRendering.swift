@@ -27,6 +27,26 @@ enum IconRendering {
         !name.isEmpty && NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil
     }
 
+    /// Composite an icon onto a translucent dark circle with a faint rim — the badge
+    /// behind icons drawn ON a wallpaper thumbnail (the `.largeOver` style in the
+    /// Mission Control overlay and the switcher popups), so the icon reads against any
+    /// wallpaper instead of blending in. Flatten template images to their final color
+    /// BEFORE badging; the badge draws them verbatim.
+    static func circleBadged(_ icon: NSImage, pad: CGFloat = 8) -> NSImage {
+        let d = (max(icon.size.width, icon.size.height) + pad * 2).rounded()
+        return NSImage(size: NSSize(width: d, height: d), flipped: false) { rect in
+            let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
+            NSColor.black.withAlphaComponent(0.40).setFill()
+            circle.fill()
+            NSColor.white.withAlphaComponent(0.15).setStroke()
+            circle.lineWidth = 1
+            circle.stroke()
+            icon.draw(in: NSRect(x: (d - icon.size.width) / 2, y: (d - icon.size.height) / 2,
+                                 width: icon.size.width, height: icon.size.height))
+            return true
+        }
+    }
+
     static func selfChecks(_ check: SelfTest.Check) {
         // OS-dependent smoke checks: same inputs are deterministic on a given macOS.
         check(isValidSymbol("star.fill"), "icons: known SF Symbol validates")

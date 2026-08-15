@@ -80,6 +80,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             currentUUIDs: Set(displaySpaces.filter(\.isCurrent).map(\.uuid)),
             showIcon: Prefs.menuBarShowIcon,
             showName: Prefs.menuBarShowName,
+            showNumber: Prefs.menuBarShowNumber,
             showSwitcher: Prefs.menuBarShowSwitcher,
             title: { [weak self] in self?.title(for: $0) ?? "" },
             icon: { [weak self] space in

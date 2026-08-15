@@ -166,8 +166,10 @@ final class MenuBarStripView: NSView {
     /// display, every display's otherwise (a wider gap separates display groups, and
     /// each display's current space is marked). `currentUUIDs` holds the current space
     /// of every included display. `title`/`icon` resolve a space's display name and icon.
+    /// `showNumber` prefixes the current-space segment with its 1-based ordinal
+    /// ("3 · Media"; just "3" when the name is off).
     func update(displaySpaces: [Space], currentUUIDs: Set<String>,
-                showIcon: Bool, showName: Bool, showSwitcher: Bool,
+                showIcon: Bool, showName: Bool, showNumber: Bool, showSwitcher: Bool,
                 title: (Space) -> String, icon: (Space) -> NSImage?) {
         hideTooltip()   // pieces are about to change; drop any showing tooltip + its stale index.
         let iconsStyle = Prefs.workspaceListStyle == .icons
@@ -186,13 +188,20 @@ final class MenuBarStripView: NSView {
                 // space would duplicate what a tile already draws — but unmarked, so
                 // with backgrounds off nothing would distinguish it. Let it fall
                 // through to a (flipped) icon tile instead.
+                // The number is redundant in the Numbers list style — the current
+                // space's square already shows it — so there it only ever joins a
+                // shown name; in the Icons style it earns the text segment on its own.
+                let numText = showNumber ? "\(space.ordinalOnDisplay + 1)" : nil
                 let kind: Piece.Kind
-                if isCur && (showName || (showIcon && !iconsStyle)) {
+                if isCur && (showName || (showNumber && iconsStyle) || (showIcon && !iconsStyle)) {
                     // Icon-only with no icon set: fall back to the placeholder so the
-                    // current segment never renders empty. With the name on, the name
-                    // alone is enough — no placeholder.
-                    let fallback = (showIcon && !showName) ? Self.placeholderIcon : nil
-                    kind = .iconName(icon: showIcon ? (img ?? fallback) : nil, name: showName ? name : nil)
+                    // current segment never renders empty. With the name or number on,
+                    // the text alone is enough — no placeholder.
+                    let text = [iconsStyle || showName ? numText : nil, showName ? name : nil]
+                        .compactMap { $0 }.joined(separator: " · ")
+                    let fallback = (showIcon && text.isEmpty) ? Self.placeholderIcon : nil
+                    kind = .iconName(icon: showIcon ? (img ?? fallback) : nil,
+                                     name: text.isEmpty ? nil : text)
                 } else if iconsStyle {
                     kind = .iconTile(icon: img, current: isCur)
                 } else {
@@ -202,16 +211,18 @@ final class MenuBarStripView: NSView {
                                    newDisplay: i > 0 && space.displayIndex != displaySpaces[i - 1].displayIndex,
                                    tipName: name, tipIcon: img))
             }
-        } else if showIcon || showName, !displaySpaces.isEmpty {
+        } else if showIcon || showName || showNumber, !displaySpaces.isEmpty {
             // One segment per included display's current space (a single one when the
             // strip follows the focused display).
             let segments = currents.isEmpty ? Array(displaySpaces.prefix(1)) : currents
             for (i, current) in segments.enumerated() {
                 let name = title(current)
                 let img = icon(current)
-                let fallback = (showIcon && !showName) ? Self.placeholderIcon : nil
+                let text = [showNumber ? "\(current.ordinalOnDisplay + 1)" : nil,
+                            showName ? name : nil].compactMap { $0 }.joined(separator: " · ")
+                let fallback = (showIcon && text.isEmpty) ? Self.placeholderIcon : nil
                 built.append(Piece(kind: .iconName(icon: showIcon ? (img ?? fallback) : nil,
-                                                   name: showName ? name : nil),
+                                                   name: text.isEmpty ? nil : text),
                                    uuid: current.uuid, isCurrent: true, newDisplay: i > 0,
                                    tipName: name, tipIcon: img))
             }

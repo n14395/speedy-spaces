@@ -884,7 +884,7 @@ if CommandLine.arguments.contains("--probe-strip") {
         manager.spaces.filter { $0.displayIndex == cur.displayIndex }.sorted { $0.ordinalOnDisplay < $1.ordinalOnDisplay }
     } ?? manager.spaces
     let currentUUIDs = Set(displaySpaces.filter(\.isCurrent).map(\.uuid))
-    // Optional trailing flags: --probe-strip [icon] [name] [switcher] [noicons]  (1/0, default 1 1 1)
+    // Optional trailing flags: --probe-strip [icon] [name] [switcher] [number]  (1/0, default 1 1 1 0)
     // `noicons` pretends no space has an icon, to exercise the placeholder fallback.
     let a = CommandLine.arguments
     let pi = a.firstIndex(of: "--probe-strip") ?? 0
@@ -892,7 +892,8 @@ if CommandLine.arguments.contains("--probe-strip") {
     let noIcons = a.contains("noicons")
     let view = MenuBarStripView()
     view.update(displaySpaces: displaySpaces, currentUUIDs: currentUUIDs,
-                showIcon: flag(1, true), showName: flag(2, true), showSwitcher: flag(3, true),
+                showIcon: flag(1, true), showName: flag(2, true), showNumber: flag(4, false),
+                showSwitcher: flag(3, true),
                 title: title, icon: noIcons ? { _ in nil } : icon)
     let size = view.intrinsicContentSize
     view.frame = NSRect(origin: .zero, size: size)

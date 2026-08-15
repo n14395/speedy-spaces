@@ -232,6 +232,12 @@ final class SettingsController: NSWindowController {
                                     target: self, action: #selector(toggleMenuBarName(_:)))
         mbNameToggle.state = Prefs.menuBarShowName ? .on : .off
 
+        let mbNumberToggle = NSButton(checkboxWithTitle: "Current space number",
+                                      target: self, action: #selector(toggleMenuBarNumber(_:)))
+        mbNumberToggle.state = Prefs.menuBarShowNumber ? .on : .off
+        mbNumberToggle.toolTip = "Show the current workspace's number (its position on the "
+            + "display) — before the name when both are on."
+
         let mbSwitcherToggle = NSButton(checkboxWithTitle: "Show Other Workspaces",
                                         target: self, action: #selector(toggleMenuBarSwitcher(_:)))
         mbSwitcherToggle.state = Prefs.menuBarShowSwitcher ? .on : .off
@@ -343,7 +349,7 @@ final class SettingsController: NSWindowController {
 
         return makePane(label: "Menu Bar", symbol: "menubar.rectangle", views: [
             displaysHeader, displayToggle, indent(collapseToggle), indent(hideSingleToggle),
-            mbIconToggle, mbNameToggle, mbSwitcherToggle, listBox, sizeRow, backgroundToggle,
+            mbIconToggle, mbNameToggle, mbNumberToggle, mbSwitcherToggle, listBox, sizeRow, backgroundToggle,
             invertBox, spacingHeader, marginRow, edgeRow, mbNote,
         ])
     }
@@ -712,6 +718,10 @@ final class SettingsController: NSWindowController {
 
     @objc private func toggleMenuBarName(_ sender: NSButton) {
         Prefs.menuBarShowName = (sender.state == .on)
+    }
+
+    @objc private func toggleMenuBarNumber(_ sender: NSButton) {
+        Prefs.menuBarShowNumber = (sender.state == .on)
     }
 
     @objc private func toggleMenuBarSwitcher(_ sender: NSButton) {

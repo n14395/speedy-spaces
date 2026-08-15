@@ -590,9 +590,10 @@ final class SwitcherBarView: NSView {
                        from: .zero, operation: .sourceOver, fraction: 1)
         } else if Prefs.thumbnailIconStyle == .largeOver, let icon = tile.icon {
             // "Large icons over the thumbnail": the space's custom icon centered on the
-            // wallpaper (fullscreen tiles keep their app badge instead). Same tint+shadow
-            // recipe as the name row so it stays readable on any wallpaper.
-            let image = icon.isTemplate ? Self.tinted(icon, color: .white) : icon
+            // wallpaper (fullscreen tiles keep their app badge instead), riding the same
+            // circular badge as the Mission Control overlay so it reads on any wallpaper.
+            let image = IconRendering.circleBadged(
+                icon.isTemplate ? Self.tinted(icon, color: .white) : icon)
             NSGraphicsContext.saveGraphicsState()
             Self.labelShadow.set()
             image.draw(in: NSRect(x: rect.midX - image.size.width / 2,
