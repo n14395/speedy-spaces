@@ -540,6 +540,16 @@ final class SwitcherBarView: NSView {
         }
     }
 
+    // AppKit's two-button emulation delivers a left click as a RIGHT click while ⌃ is
+    // held without ⌘ — which is exactly a click on this HUD with a ⌃-containing hold
+    // chord still down (measured: ⌃⌥-hold clicks arrived here and died; ⌃⌥⌘/hyper
+    // clicks arrived as plain left clicks). The HUD has no right-click behavior of its
+    // own, so the right-button trio routes through the left-button logic and a
+    // chord-held click (or tile drag) lands like any other.
+    override func rightMouseDown(with event: NSEvent) { mouseDown(with: event) }
+    override func rightMouseDragged(with event: NSEvent) { mouseDragged(with: event) }
+    override func rightMouseUp(with event: NSEvent) { mouseUp(with: event) }
+
     /// One 60 Hz timer drives the row-change glide (fixed 0.3 s, eased at draw time) and,
     /// while a drag is in flight, the continuous reflow of tiles toward their gap slots.
     private func startAnimTimerIfNeeded() {
