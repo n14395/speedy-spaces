@@ -287,8 +287,17 @@ final class MenuBarStripView: NSView {
 
     // MARK: - Drawing
 
-    override func draw(_ dirtyRect: NSRect) {
-        let midY = bounds.midY
+    /// The view paints nothing itself. Its pixels are rendered into the status-item button
+    /// as a TEMPLATE image (see `renderedImage`), because only template images get the menu
+    /// bar's own treatment: the vibrancy tint that blends every native glyph toward the
+    /// wallpaper's hue, and the dimming applied on unfocused displays. Drawing `labelColor`
+    /// straight into the view bypassed both — the glyphs came out pure black/white while
+    /// every neighbouring item sat at reduced contrast. The view remains for hit-testing
+    /// and hover tooltips.
+    override func draw(_ dirtyRect: NSRect) {}
+
+    private func drawContent(in rect: NSRect) {
+        let midY = rect.midY
         for p in pieces {
             switch p.kind {
             case let .number(n, current):
@@ -300,7 +309,7 @@ final class MenuBarStripView: NSView {
                     let path = NSBezierPath(roundedRect: rect, xRadius: m.corner, yRadius: m.corner)
                     fillColor.setFill(); path.fill()
                 }
-                drawNumber(n, in: rect, color: glyph(for: lk))
+                drawNumber(n, in: rect, color: glyph(for: lk), knockout: lk == .flipped)
             case let .iconTile(icon, current):
                 let m = numberM
                 let rect = NSRect(x: p.x + (p.width - m.side) / 2, y: midY - m.side / 2,
@@ -314,9 +323,14 @@ final class MenuBarStripView: NSView {
                     // The inset keeps the glyph proportioned like the digits, and means a
                     // 15 pt render is never upscaled (inner side ≤ 15.4 across 12–22 pt).
                     let inner = rect.insetBy(dx: m.side * 0.15, dy: m.side * 0.15)
-                    // Flipped look: inverted on the labelColor fill (emoji pass through untinted).
-                    let tinted = lk == .flipped ? Self.tinted(img, invertedGlyphColor) : img
-                    drawIcon(tinted, in: inner)
+                    // Flipped look: punch the glyph out of the fill so the treatment survives
+                    // templating. An emoji is a colour image — knocking it out would discard its
+                    // colours, so it keeps the inverted tint and draws on top as before.
+                    if lk == .flipped, img.isTemplate {
+                        drawIcon(img, in: inner, knockout: true)
+                    } else {
+                        drawIcon(lk == .flipped ? Self.tinted(img, invertedGlyphColor) : img, in: inner)
+                    }
                 }
             case let .iconName(icon, name):
                 // "Show background" applies to the whole item: the current-space segment
@@ -336,8 +350,13 @@ final class MenuBarStripView: NSView {
                 var cx = p.x + hPad
                 let hasName = (name?.isEmpty == false)
                 if let icon {
-                    drawIcon(pill && lk == .flipped ? Self.tinted(icon, invertedGlyphColor) : icon,
-                             in: NSRect(x: cx, y: midY - iconSide / 2, width: iconSide, height: iconSide))
+                    let box = NSRect(x: cx, y: midY - iconSide / 2, width: iconSide, height: iconSide)
+                    if pill, lk == .flipped, icon.isTemplate {
+                        drawIcon(icon, in: box, knockout: true)
+                    } else {
+                        drawIcon(pill && lk == .flipped ? Self.tinted(icon, invertedGlyphColor) : icon,
+                                 in: box)
+                    }
                     cx += iconSide + (hasName ? M.iconNameGap : 0)
                 }
                 if let name, hasName {
@@ -348,8 +367,14 @@ final class MenuBarStripView: NSView {
                          .paragraphStyle: para]
                     let sz = (name as NSString).size(withAttributes: [.font: nameFontObj])
                     let tw = min(M.maxNameWidth, ceil(sz.width))
-                    (name as NSString).draw(in: NSRect(x: cx, y: midY - sz.height / 2, width: tw, height: sz.height),
-                                            withAttributes: attrs)
+                    let box = NSRect(x: cx, y: midY - sz.height / 2, width: tw, height: sz.height)
+                    let knockout = pill && lk == .flipped
+                    if knockout {
+                        NSGraphicsContext.saveGraphicsState()
+                        NSGraphicsContext.current?.compositingOperation = .destinationOut
+                    }
+                    (name as NSString).draw(in: box, withAttributes: attrs)
+                    if knockout { NSGraphicsContext.restoreGraphicsState() }
                 }
             case .grid:
                 if let img = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: nil) {
@@ -359,18 +384,53 @@ final class MenuBarStripView: NSView {
         }
     }
 
-    private func drawNumber(_ n: Int, in rect: NSRect, color: NSColor) {
+    /// The strip rendered for the status-item button. Marked as a template so AppKit tints
+    /// it exactly like every other menu-bar item — unless a segment carries an emoji, which
+    /// is a colour image by design and would be flattened to a silhouette by templating.
+    func renderedImage() -> NSImage {
+        let size = intrinsicContentSize
+        let image = NSImage(size: size)
+        image.lockFocus()
+        drawContent(in: NSRect(origin: .zero, size: size))
+        image.unlockFocus()
+        image.isTemplate = !hasColorContent
+        return image
+    }
+
+    /// True when a segment carries a colour (non-template) image — i.e. an emoji icon.
+    private var hasColorContent: Bool {
+        pieces.contains { piece in
+            switch piece.kind {
+            case let .iconTile(icon, _): return !((icon ?? defaultIconImage)?.isTemplate ?? true)
+            case let .iconName(icon, _): return !(icon?.isTemplate ?? true)
+            default: return false
+            }
+        }
+    }
+
+    /// `knockout` punches the glyph out of what's already drawn instead of painting over it.
+    /// That is what makes the flipped (current-space) look survive templating: the filled
+    /// square is the only opaque part, and the digit is a hole in it, so AppKit's tint paints
+    /// the square and the bar shows through the digit.
+    private func drawNumber(_ n: Int, in rect: NSRect, color: NSColor, knockout: Bool = false) {
         let s = "\(n)" as NSString
         let attrs: [NSAttributedString.Key: Any] = [.font: numberFontObj, .foregroundColor: color]
         let sz = s.size(withAttributes: attrs)
-        s.draw(at: NSPoint(x: rect.midX - sz.width / 2, y: rect.midY - sz.height / 2), withAttributes: attrs)
+        let at = NSPoint(x: rect.midX - sz.width / 2, y: rect.midY - sz.height / 2)
+        guard knockout else { return s.draw(at: at, withAttributes: attrs) }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.compositingOperation = .destinationOut
+        s.draw(at: at, withAttributes: attrs)
+        NSGraphicsContext.restoreGraphicsState()
     }
 
-    private func drawIcon(_ image: NSImage, in rect: NSRect) {
+    private func drawIcon(_ image: NSImage, in rect: NSRect, knockout: Bool = false) {
         let img = image.isTemplate ? Self.tinted(image, .labelColor) : image
         let scale = min(rect.width / max(img.size.width, 1), rect.height / max(img.size.height, 1), 1)
         let w = img.size.width * scale, h = img.size.height * scale
-        img.draw(in: NSRect(x: rect.midX - w / 2, y: rect.midY - h / 2, width: w, height: h))
+        let r = NSRect(x: rect.midX - w / 2, y: rect.midY - h / 2, width: w, height: h)
+        img.draw(in: r, from: .zero,
+                 operation: knockout ? .destinationOut : .sourceOver, fraction: 1)
     }
 
     /// Tint a template image to `color` (color/emoji images pass through unchanged).

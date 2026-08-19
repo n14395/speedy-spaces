@@ -89,6 +89,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             }
         )
         statusItem.length = strip.intrinsicContentSize.width
+        // Hand the strip to AppKit as an image rather than letting the view paint the menu
+        // bar directly: only images the button owns get the menu bar's vibrancy tint (which
+        // pulls every native glyph toward the wallpaper's hue) and its dimming on unfocused
+        // displays. Self-drawn pixels rendered at full labelColor — pure black on a light bar,
+        // pure white on a tinted one — next to neighbours sitting well below full contrast.
+        if let button = statusItem.button {
+            button.image = strip.renderedImage()
+            button.imagePosition = .imageOnly
+        }
     }
 
     /// Pure filter for the all-displays strip: sorted by (display, ordinal), optionally
