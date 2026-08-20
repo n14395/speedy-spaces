@@ -47,10 +47,17 @@ final class SwitcherHUD {
     /// (the switch/move shortcuts share modifiers with the hold chord) linger for the settable
     /// minimum instead of vanishing the instant the chord is released.
     private var lastSpaceChangeAt = Date.distantPast
-    /// A deferred (Show-Desktop) switch is in flight until this deadline. Keeps the popover up
-    /// across a chord release and through the dismiss delay, so the transition stays continuous
-    /// until the delayed switch actually lands. Set on `.speedySpacesAnticipateSwitch`.
+    /// An anticipated switch is in flight until this deadline: initiation, the window
+    /// server's slide, and the usual tail after it lands (plus the Dock's dismiss beat for a
+    /// deferred Show-Desktop switch). Keeps the popover up across a chord release and stops
+    /// the landing's re-flash from cutting the transition short, so it stays continuous from
+    /// before the animation to after it. Set on `.speedySpacesAnticipateSwitch`.
     private var switchPendingUntil = Date.distantPast
+    /// The window server's own space slide, measured at ~0.85 s from initiation to settle.
+    private static let slideAllowance: TimeInterval = 0.9
+    /// Extra cover for a deferred switch: the Show-Desktop overlay wait (≤0.6 s) plus the
+    /// settle beat SpacesManager waits out before re-firing the switch (see switchTo).
+    private static let showDesktopDismissAllowance: TimeInterval = 1.1
     /// True while the real Mission Control is (probably) on screen — never draw over it.
     private var mcSuppressed = false
     private var mcClearTimer: Timer?
@@ -87,6 +94,11 @@ final class SwitcherHUD {
     private var directionalLoadedAt = Date.distantPast
     /// Throttle for the streaming dock-swipe gesture events (see nativeDockSwipe).
     private var lastDockSwipeFlash = Date.distantPast
+    /// True while `barPointerMoved` holds a flash open under an actively-moving pointer.
+    /// Paired with the release in `barHoverChanged`: only a flash that was actually pinned
+    /// gets a fresh countdown when the pointer leaves, so a cursor merely crossing the band
+    /// can't stretch an otherwise-normal flash. Cleared by any new countdown.
+    private var hoverPinned = false
 
     /// In-flight tile drag (drag-to-reorder). Coordinates across all panels: only
     /// `SwitcherHUD` sees every display, so the origin panel owns the mouse events while
@@ -466,16 +478,16 @@ final class SwitcherHUD {
         guard visibility == .held else { return }
         // The switch / move-window shortcuts usually SHARE modifiers with the hold chord, so the
         // popover comes up as .held and would vanish the instant those modifiers lift — too brief
-        // to read. Keep it up across the release if a workspace changed during the hold OR a switch
-        // is still in flight behind a Show-Desktop dismiss (deferred), so the transition stays
-        // continuous instead of blinking out between release and the delayed landing.
+        // to read. Keep it up across the release if a workspace changed during the hold OR an
+        // anticipated switch is still in flight, so the transition stays continuous instead of
+        // blinking out between the release and the landing.
         let sinceSwitch = Date().timeIntervalSince(lastSpaceChangeAt)
-        let pending = switchPendingUntil.timeIntervalSinceNow   // > 0 while a deferred switch is in flight
+        let pending = switchPendingUntil.timeIntervalSinceNow   // > 0 while a switch is in flight
         if Prefs.switcherFlashOnSpaceChange, pending > 0 || sinceSwitch < flashDuration {
             teardownDropTap()
             visibility = .flashing
-            // Deferred switch: hold until it lands (spacesChanged re-flashes; capped at the pending
-            // deadline). Otherwise just the remaining settable minimum.
+            // Switch in flight: hold until it lands (spacesChanged re-flashes; capped at the
+            // pending deadline). Otherwise just the remaining settable minimum.
             restartFlashTimer(pending > 0 ? max(flashDuration, pending) : flashDuration - sinceSwitch)
         } else {
             hideAll(animated: true)
@@ -493,24 +505,39 @@ final class SwitcherHUD {
 
     /// Flash only the given displays (nil = all). `duration` defaults to the normal
     /// flash; anticipation callers pass the longer window that bridges the native slide.
-    private func flash(displayIdentifiers: Set<String>?, duration: TimeInterval? = nil) {
+    /// `animated: false` skips the fade-in for callers that need pixels on screen this turn.
+    private func flash(displayIdentifiers: Set<String>?, duration: TimeInterval? = nil,
+                       animated: Bool = true) {
         guard enabled, !mcSuppressed, visibility != .held else { return }
         visibility = .flashing
-        show(displayFilter: displayIdentifiers, animated: true, refreshData: false)
+        show(displayFilter: displayIdentifiers, animated: animated, refreshData: false)
         restartFlashTimer(duration ?? flashDuration)
     }
 
-    /// A switch was requested but is deferred behind a Show-Desktop dismiss (see
-    /// SpacesManager.switchTo). Flash right away so the popover is up before the space changes,
-    /// with the anticipation window bridging the dismiss+settle delay; the landing then re-flashes
-    /// so it stays continuous. Respects the flash-on-change preference like any space-change flash.
+    /// A switch is about to be initiated (see SpacesManager.switchTo, which posts this
+    /// immediately before handing the switch to its engine — or, for a switch deferred behind a
+    /// Show-Desktop dismiss, before the dismiss). Put the popover up NOW, ahead of the
+    /// transition: a window ordered in once the window server has begun the slide isn't
+    /// composited until the slide ends, so a flash raised at initiation used to surface only
+    /// after the animation had already played out. Respects the flash-on-change preference like
+    /// any space-change flash.
     @objc private func anticipateSwitch(_ note: Notification) {
         guard Prefs.switcherFlashOnSpaceChange else { return }
-        // Mark a deferred switch in flight so a chord release before it lands keeps the popover up
-        // (chordUp) and each re-flash holds the longer window — covers the dismiss+settle+switch.
-        switchPendingUntil = Date().addingTimeInterval(2.5)
+        // Mark the switch in flight so a chord release before it lands keeps the popover up
+        // (chordUp) and the landing's re-flash doesn't shorten the transition (spacesChanged):
+        // the deadline covers the slide plus the settable minimum, so the popover outlives the
+        // animation by the same tail it used to show for on its own.
+        let deferred = note.userInfo?["deferred"] as? Bool ?? false
+        switchPendingUntil = Date().addingTimeInterval(
+            (deferred ? Self.showDesktopDismissAllowance : 0) + Self.slideAllowance + flashDuration)
         let display = note.userInfo?["display"] as? String
-        flash(displayIdentifiers: display.map { Set([$0]) }, duration: anticipationFlashDuration)
+        // Unanimated, then flushed: the caller starts the transition the moment this
+        // notification finishes dispatching, so a 0.12 s fade-in — or even the run loop's
+        // ordinary end-of-turn commit — would miss the window entirely.
+        flash(displayIdentifiers: display.map { Set([$0]) },
+              duration: max(anticipationFlashDuration, switchPendingUntil.timeIntervalSinceNow),
+              animated: false)
+        for panel in panels.values { panel.flushToScreen() }
     }
 
     // MARK: - Panels
@@ -581,10 +608,11 @@ final class SwitcherHUD {
     /// A flash stays open only while the pointer ACTIVELY hovers the band — but a cursor that
     /// merely rests where the flash happens to appear must NOT pin it (that left it up forever).
     /// So entering does nothing on its own; real movement over the bar (barPointerMoved) engages
-    /// the pin, and leaving restarts the normal countdown.
+    /// the pin, and leaving releases it into a fresh countdown. Both edges are reported by the
+    /// panel's pointer watch — an AppKit mouseExited can't be relied on here (SwitcherPanel).
     private func barHoverChanged(_ inside: Bool) {
         guard drag == nil, visibility == .flashing else { return }
-        if !inside { restartFlashTimer(flashDuration) }
+        if !inside, hoverPinned { restartFlashTimer(flashDuration) }
     }
 
     /// Actual pointer movement over the band engages the hover pin (Mission Control's bar behaves
@@ -592,6 +620,7 @@ final class SwitcherHUD {
     private func barPointerMoved() {
         guard drag == nil, visibility == .flashing else { return }
         cancelFlashTimer()
+        hoverPinned = true
     }
 
     // MARK: - Drag-to-reorder
@@ -956,6 +985,7 @@ final class SwitcherHUD {
     // MARK: - Timers & notifications
 
     private func restartFlashTimer(_ duration: TimeInterval) {
+        hoverPinned = false   // any fresh countdown supersedes the hover pin
         flashTimer?.invalidate()
         flashTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
             guard let self, self.visibility == .flashing else { return }
@@ -1035,9 +1065,11 @@ final class SwitcherHUD {
         switch visibility {
         case .held, .flashing:
             refreshVisible()
-            // Rapid consecutive switches keep one continuous flash instead of flickering; while a
-            // deferred (Show-Desktop) switch is still pending, hold the longer window so the popover
-            // stays continuous through the dismiss delay — once it lands, the min-shown wins.
+            // Rapid consecutive switches keep one continuous flash instead of flickering. An
+            // anticipated switch lands here at INITIATION (the optimistic prediction posts
+            // immediately), so honour its pending deadline too — otherwise the countdown would
+            // start with the whole animation still ahead and the popover could go before the
+            // transition finished. Once that deadline passes, the min-shown wins.
             if visibility == .flashing, !changed.isEmpty {
                 restartFlashTimer(max(flashDuration, switchPendingUntil.timeIntervalSinceNow))
             }

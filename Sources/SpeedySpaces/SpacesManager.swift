@@ -332,7 +332,8 @@ final class SpacesManager {
             // Show the switcher immediately so the popover bridges the dismiss+settle delay,
             // staying up continuously until the space actually changes (the landing re-flashes it).
             NotificationCenter.default.post(name: .speedySpacesAnticipateSwitch, object: nil,
-                                            userInfo: ["display": target.displayIdentifier])
+                                            userInfo: ["display": target.displayIdentifier,
+                                                       "deferred": true])
             _ = sm_coreDockSendNotification("com.apple.showdesktop.awake" as CFString)
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 // Wait for the overlay window to clear...
@@ -366,6 +367,17 @@ final class SpacesManager {
             if reason.localizedCaseInsensitiveContains("accessibility") { onAccessibilityNeeded?() }
             return false
         case .available:
+            // Raise the switcher BEFORE the engine starts the transition. The window server
+            // doesn't composite a window ordered in once the space slide is under way — it
+            // surfaces only when the slide ends — so the popover used to appear after the
+            // animation rather than ahead of it. The HUD shows synchronously on this
+            // notification and holds through the transition (see SwitcherHUD.anticipateSwitch).
+            // Not for the Mission Control engine: it puts the real Mission Control on screen,
+            // which the HUD suppresses itself for — anticipating there is just a blink.
+            if engine.method != .missionControl {
+                NotificationCenter.default.post(name: .speedySpacesAnticipateSwitch, object: nil,
+                                                userInfo: ["display": target.displayIdentifier])
+            }
             let start = DispatchTime.now()
             do { try engine.perform(target, ctx) }
             catch {

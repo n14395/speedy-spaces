@@ -1,152 +1,332 @@
 #!/bin/bash
-# Builds SpeedySpaces.app using only the Swift toolchain / Command Line Tools
-# (no full Xcode required). Output: build/SpeedySpaces.app
+# SpeedySpaces — build, package, sign and publish.
+#
+#   ./build.sh                 build the production build/SpeedySpaces.app
+#   ./build.sh --dmg           …and package it into build/SpeedySpaces.dmg
+#   ./build.sh --sign          …Developer ID sign the .app and .dmg, notarize and staple
+#   ./build.sh --publish vN.N  tag, push and cut a GitHub release from build/SpeedySpaces.dmg
+#
+# Flags combine — `./build.sh --sign --publish v1.2` signs, notarizes and releases in
+# one go. `--publish` on its own does not rebuild: it requires build/SpeedySpaces.dmg to
+# already exist.
 set -euo pipefail
+cd "$(dirname "$0")"
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-SRC="$ROOT/Sources/SpeedySpaces"
-BUILD="$ROOT/build"
-APP="$BUILD/SpeedySpaces.app"
-DEPLOY_TARGET="14.0"
-ARCH="$(uname -m)"
+APP_NAME="SpeedySpaces"
+BUILD_DIR="$PWD/build"
+APP_PATH="$BUILD_DIR/$APP_NAME.app"
+DMG_PATH="$BUILD_DIR/$APP_NAME.dmg"
+BUNDLE_ID=""
+ENTITLEMENTS="$PWD/SpeedySpaces.entitlements"
 
-echo "==> Cleaning"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# Exported from ~/.zshrc. The literal fallback keeps the script working when it is
+# run from a shell that never sourced it (cron, a GUI runner, `env -i`).
+DEV_TEAM_IDENTITY="${DEV_TEAM_IDENTITY:-Developer ID Application: Nicholas Fay (P52946XHRJ)}"
+NOTARY_PROFILE="notary-profile"
 
-echo "==> Info.plist + resources"
-cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
-if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
-    cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-fi
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
-echo "==> Compiling C shim"
-clang -c "$SRC/CGSShim.c" -o "$BUILD/CGSShim.o" \
-    -target "${ARCH}-apple-macos${DEPLOY_TARGET}"
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 
-echo "==> Compiling Swift + linking"
-swiftc \
-    -o "$APP/Contents/MacOS/SpeedySpaces" \
-    -target "${ARCH}-apple-macos${DEPLOY_TARGET}" \
-    -import-objc-header "$SRC/CGSPrivate.h" \
-    -framework AppKit \
-    -framework ServiceManagement \
-    -framework Carbon \
-    -framework AppIntents \
-    "$BUILD/CGSShim.o" \
-    "$SRC"/*.swift
-
-# --- App Intents metadata (native macOS Shortcuts actions) — best-effort, guarded ---
-# Shortcuts discovery needs Apple's App Intents metadata bundle, produced by
-# `appintentsmetadataprocessor` — a tool that ships only with FULL Xcode, not the Command
-# Line Tools. When a full Xcode is present we emit Swift const-values and run the extractor
-# (must land before codesign so it's covered); otherwise we skip cleanly. Either way the app
-# runs and the speedyspaces:// URL scheme + CLI work — this only governs whether the actions
-# show up natively in the Shortcuts app.
-AI_DEV=""
-for dev in "$(xcode-select -p 2>/dev/null)" /Applications/Xcode*.app/Contents/Developer; do
-    if [ -x "$dev/Toolchains/XcodeDefault.xctoolchain/usr/bin/appintentsmetadataprocessor" ]; then
-        AI_DEV="$dev"; break
-    fi
+WANT_DMG=0
+WANT_SIGN=0
+PUBLISH_VERSION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dmg)   WANT_DMG=1 ;;
+        --sign)  WANT_SIGN=1 ;;
+        --publish)
+            [[ $# -ge 2 ]] || die "--publish needs a version argument, e.g. --publish v1.2"
+            PUBLISH_VERSION="$2"; shift ;;
+        --publish=*) PUBLISH_VERSION="${1#*=}" ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown flag: $1 (try --help)" ;;
+    esac
+    shift
 done
-if [ -n "$AI_DEV" ]; then
-    echo "==> App Intents: extracting Shortcuts metadata (via $AI_DEV)"
-    AI_TC="$AI_DEV/Toolchains/XcodeDefault.xctoolchain"
-    AI_SDK="$(xcrun --show-sdk-path)"
-    AI_XCV="$(defaults read "$AI_DEV/../version" ProductBuildVersion 2>/dev/null || echo 0)"
-    # Protocol names are UNQUALIFIED (no `AppIntents.` prefix) — the const gatherer matches
-    # nothing with a module prefix.
-    printf '%s\n' '["AppIntent","AppEntity","AppEnum","EntityQuery","EntityPropertyQuery","DynamicOptionsProvider","AppShortcutsProvider","PersistentAppEntity","EntityIdentifierConvertible"]' \
-        > "$BUILD/appintents-protocols.json"
-    # A separate whole-module pass emits const-values only. `-module-name SpeedySpaces` is
-    # required so the extracted type names match `--module-name` below (otherwise they take
-    # the -o basename and the extractor can't resolve them); the object output is discarded.
-    if swiftc -wmo -module-name SpeedySpaces \
-        -target "${ARCH}-apple-macos${DEPLOY_TARGET}" \
-        -import-objc-header "$SRC/CGSPrivate.h" \
-        -framework AppKit -framework ServiceManagement -framework Carbon -framework AppIntents \
-        -emit-const-values-path "$BUILD/SpeedySpaces.swiftconstvalues" \
-        -Xfrontend -const-gather-protocols-file -Xfrontend "$BUILD/appintents-protocols.json" \
-        -c -o "$BUILD/appintents-const.o" \
-        "$SRC"/*.swift 2>/dev/null
-    then
-        ls "$SRC"/*.swift > "$BUILD/appintents-sources.txt"
-        echo "$BUILD/SpeedySpaces.swiftconstvalues" > "$BUILD/appintents-constvals.txt"
-        if "$AI_TC/usr/bin/appintentsmetadataprocessor" \
-            --toolchain-dir "$AI_TC" --sdk-root "$AI_SDK" --module-name SpeedySpaces \
-            --target-triple "${ARCH}-apple-macos${DEPLOY_TARGET}" \
-            --deployment-target "$DEPLOY_TARGET" --platform-family macOS --xcode-version "$AI_XCV" \
-            --source-file-list "$BUILD/appintents-sources.txt" \
-            --swift-const-vals-list "$BUILD/appintents-constvals.txt" \
-            --output "$APP/Contents/Resources" >/dev/null 2>&1
-        then
-            echo "==> App Intents: Metadata.appintents written"
-        else
-            echo "==> App Intents: extractor failed — skipping (URL scheme + CLI still work)"
-        fi
+
+# vN.N or vN.N.N — anything else is a typo we would rather catch before tagging.
+if [[ -n "$PUBLISH_VERSION" ]]; then
+    [[ "$PUBLISH_VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] \
+        || die "--publish needs a version like v1.2 or v1.2.3 (got: '$PUBLISH_VERSION')"
+    VERSION_NUM="${PUBLISH_VERSION#v}"
+fi
+
+# Full Xcode, not the bare Command Line Tools: xcodebuild refuses to run under
+# CLT, and even SwiftPM needs Xcode's toolchain for the SwiftUI macro plugins.
+# Set DEVELOPER_DIR for this process only — the system default is left alone.
+if [[ -z "${DEVELOPER_DIR:-}" ]] && ! xcode-select -p 2>/dev/null | grep -q '\.app'; then
+    for xc in /Applications/Xcode.app /Applications/Xcode-beta.app; do
+        if [[ -d "$xc" ]]; then export DEVELOPER_DIR="$xc/Contents/Developer"; break; fi
+    done
+fi
+
+# Sign with a *stable* identity so macOS keeps the Accessibility grant across
+# rebuilds — an ad-hoc signature is keyed to the code hash, which changes every
+# build, and losing that grant breaks space switching AND the Mission Control
+# dismissal watch. --sign re-signs with Developer ID on top of this.
+dev_sign() {
+    local id
+    id="${CODESIGN_IDENTITY:-${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk '/Apple Development/ {print $2; exit}')}}"
+    id="${id:--}"
+    if [[ "$id" == "-" ]]; then
+        echo "    ad-hoc signed (the Accessibility grant will NOT persist across rebuilds)"
     else
-        echo "==> App Intents: const-values pass failed — skipping (URL scheme + CLI still work)"
+        echo "    signed with $id"
     fi
-else
-    echo "==> App Intents: no full Xcode found — skipping native Shortcuts actions (URL scheme + CLI still work)"
+    codesign --force --sign "$id" --entitlements "$ENTITLEMENTS" --options runtime "$APP_PATH" 2>/dev/null \
+        || codesign --force --sign "$id" --entitlements "$ENTITLEMENTS" "$APP_PATH"
+}
+
+# A plain drag-to-install image: the app plus an /Applications symlink, nothing
+# else. Staged under build/ so the volume contains exactly those two items and
+# no stray DerivedData.
+DMG_STAGING="$BUILD_DIR/.dmg-staging"
+cleanup() { rm -rf "$DMG_STAGING"; return 0; }
+trap cleanup EXIT
+
+make_dmg() {
+    [[ -d "$APP_PATH" ]] || die "$APP_PATH not found — build it first"
+    step "Packaging $APP_NAME.dmg"
+    rm -rf "$DMG_STAGING"
+    mkdir -p "$DMG_STAGING"
+    # ditto, not cp: it preserves the code signature and extended attributes.
+    ditto "$APP_PATH" "$DMG_STAGING/$APP_NAME.app"
+    ln -s /Applications "$DMG_STAGING/Applications"
+    rm -f "$DMG_PATH"
+    hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGING" \
+        -fs HFS+ -format UDZO -ov -quiet "$DMG_PATH"
+    rm -rf "$DMG_STAGING"
+    echo "    $DMG_PATH"
+}
+
+# codesign never recurses into nested code, and the notary service rejects a
+# bundle whose frameworks / app extensions / bundled helper binaries still carry
+# an older signature. So sign inside-out, deepest path first, then the bundle
+# itself. Entitlements are read back off each item and re-applied: a bare
+# --force re-sign silently drops them, which would break sandboxing and TCC.
+sign_one() {
+    local target="$1" ent="" args=()
+    if [[ "$target" == "$APP_PATH" && -n "$ENTITLEMENTS" && -f "$ENTITLEMENTS" ]]; then
+        args+=(--entitlements "$ENTITLEMENTS")
+    else
+        ent="$(mktemp "${TMPDIR:-/tmp}/entitlements.XXXXXX")"
+        if codesign -d --entitlements - --xml "$target" 2>/dev/null | grep -q '<plist'; then
+            codesign -d --entitlements - --xml "$target" 2>/dev/null >"$ent"
+            # get-task-allow is the debugger entitlement Xcode injects into
+            # development-signed builds. The notary service rejects any binary
+            # that still requests it, so drop it before re-signing.
+            /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.get-task-allow' \
+                "$ent" >/dev/null 2>&1 || true
+            args+=(--entitlements "$ent")
+        else
+            rm -f "$ent"; ent=""
+        fi
+    fi
+    codesign --force --options runtime --timestamp \
+        ${args[@]+"${args[@]}"} --sign "$DEV_TEAM_IDENTITY" "$target"
+    [[ -n "$ent" ]] && rm -f "$ent"
+    echo "    signed ${target#$BUILD_DIR/}"
+}
+
+sign_bundle() {
+    local inner
+    while IFS= read -r inner; do
+        sign_one "$inner"
+    done < <(
+        {
+            find "$APP_PATH/Contents" \
+                \( -name '*.framework' -o -name '*.appex' -o -name '*.xpc' \
+                   -o -name '*.app' -o -name '*.bundle' -o -name '*.dylib' \
+                   -o -name '*.so' \) 2>/dev/null
+            # Loose Mach-O helpers: bundled CLIs in Resources, login items…
+            find "$APP_PATH/Contents" -type f -perm -u+x 2>/dev/null \
+                | while IFS= read -r f; do
+                      file -b "$f" 2>/dev/null | grep -q 'Mach-O' && printf '%s\n' "$f"
+                  done
+        } | grep -v "/Contents/MacOS/[^/]*$" \
+          | sort -u | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-
+    )
+    sign_one "$APP_PATH"
+}
+
+sign_and_notarize() {
+    step "Developer ID signing $APP_NAME.app"
+    echo "    identity: $DEV_TEAM_IDENTITY"
+    sign_bundle
+
+    make_dmg
+
+    step "Developer ID signing $APP_NAME.dmg"
+    codesign --force --timestamp --sign "$DEV_TEAM_IDENTITY" "$DMG_PATH"
+
+    step "Verifying the .dmg signature"
+    if ! codesign --verify --verbose=2 "$DMG_PATH"; then
+        die "codesign --verify failed for $DMG_PATH — not submitting for notarization"
+    fi
+
+    step "Notarizing (this waits on Apple; usually a few minutes)"
+    local out rc=0 status uuid
+    out="$(xcrun notarytool submit "$DMG_PATH" \
+        --keychain-profile "$NOTARY_PROFILE" --wait 2>&1)" || rc=$?
+    printf '%s\n' "$out"
+    [[ $rc -eq 0 ]] || die "notarytool submit failed (exit $rc)"
+
+    status="$(printf '%s\n' "$out" | awk -F': *' '/^ *status:/ {print $2; exit}')"
+    uuid="$(printf '%s\n' "$out"   | awk -F': *' '/^ *id:/     {print $2; exit}')"
+    if [[ "$status" != "Accepted" ]]; then
+        if [[ -n "$uuid" ]]; then
+            step "Fetching the notarization log"
+            xcrun notarytool log "$uuid" --keychain-profile "$NOTARY_PROFILE" \
+                "$BUILD_DIR/notary-log.json" || true
+            echo "    log written to $BUILD_DIR/notary-log.json"
+        fi
+        die "notarization returned status: ${status:-unknown}"
+    fi
+
+    step "Stapling the ticket"
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler validate "$DMG_PATH"
+
+    step "Gatekeeper assessment"
+    spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
+
+    step "Notarized and stapled: $DMG_PATH"
+}
+
+publish() {
+    step "Publishing $PUBLISH_VERSION"
+    [[ -f "$DMG_PATH" ]] \
+        || die ".dmg not found: $DMG_PATH — run ./build.sh --dmg (or --sign) first"
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        || die "$PWD is not inside a git repository — cannot tag or release"
+    command -v gh >/dev/null 2>&1 || die "the GitHub CLI (gh) is not installed"
+    git remote get-url origin >/dev/null 2>&1 \
+        || die "this repository has no 'origin' remote — cannot push the tag"
+
+    local versioned="$BUILD_DIR/$APP_NAME-$VERSION_NUM.dmg"
+    cp -f "$DMG_PATH" "$versioned"
+    echo "    $versioned"
+
+    git tag -a "$PUBLISH_VERSION" -m "Release $PUBLISH_VERSION"
+    git push origin "$PUBLISH_VERSION"
+    gh release create "$PUBLISH_VERSION" "$versioned" --verify-tag --generate-notes
+}
+
+build_app() {
+    local src="$PWD/Sources/SpeedySpaces"
+    local obj="$BUILD_DIR/.intermediates"
+    local deploy_target="14.0" arch
+    arch="$(uname -m)"
+
+    step "Building $APP_NAME (release)"
+    # SpeedySpaces pokes at the private CoreGraphics Spaces API through a C
+    # shim, so it is compiled by hand with swiftc rather than via SwiftPM.
+    rm -rf "$APP_PATH" "$obj"
+    mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources" "$obj"
+
+    cp Resources/Info.plist "$APP_PATH/Contents/Info.plist"
+    if [[ -f Resources/AppIcon.icns ]]; then
+        cp Resources/AppIcon.icns "$APP_PATH/Contents/Resources/AppIcon.icns"
+    fi
+
+    clang -c "$src/CGSShim.c" -o "$obj/CGSShim.o" \
+        -target "${arch}-apple-macos${deploy_target}"
+
+    swiftc \
+        -o "$APP_PATH/Contents/MacOS/SpeedySpaces" \
+        -target "${arch}-apple-macos${deploy_target}" \
+        -import-objc-header "$src/CGSPrivate.h" \
+        -framework AppKit \
+        -framework ServiceManagement \
+        -framework Carbon \
+        -framework AppIntents \
+        "$obj/CGSShim.o" \
+        "$src"/*.swift
+
+    build_appintents_metadata "$src" "$obj" "$arch" "$deploy_target"
+
+    dev_sign
+    echo "    $APP_PATH"
+}
+
+# Native Shortcuts actions need Apple's App Intents metadata bundle, produced by
+# `appintentsmetadataprocessor` — a tool that ships only with full Xcode, not the
+# Command Line Tools. When it is available we emit Swift const-values and run the
+# extractor (before codesign, so the output is covered by the signature);
+# otherwise we skip cleanly. Either way the app runs and the speedyspaces:// URL
+# scheme + CLI work — this only governs native Shortcuts discovery.
+build_appintents_metadata() {
+    local src="$1" obj="$2" arch="$3" deploy_target="$4"
+    local dev="" tc sdk xcv
+
+    for candidate in "$(xcode-select -p 2>/dev/null)" /Applications/Xcode*.app/Contents/Developer; do
+        if [[ -x "$candidate/Toolchains/XcodeDefault.xctoolchain/usr/bin/appintentsmetadataprocessor" ]]; then
+            dev="$candidate"; break
+        fi
+    done
+    if [[ -z "$dev" ]]; then
+        echo "    App Intents: no full Xcode — skipping native Shortcuts actions"
+        return 0
+    fi
+
+    tc="$dev/Toolchains/XcodeDefault.xctoolchain"
+    sdk="$(xcrun --show-sdk-path)"
+    xcv="$(defaults read "$dev/../version" ProductBuildVersion 2>/dev/null || echo 0)"
+
+    # Protocol names must be UNQUALIFIED — the const gatherer matches nothing
+    # when they carry an `AppIntents.` module prefix.
+    printf '%s\n' '["AppIntent","AppEntity","AppEnum","EntityQuery","EntityPropertyQuery","DynamicOptionsProvider","AppShortcutsProvider","PersistentAppEntity","EntityIdentifierConvertible"]' \
+        >"$obj/appintents-protocols.json"
+
+    # A separate whole-module pass that emits const-values only. -module-name is
+    # required so the extracted type names match --module-name below (otherwise
+    # they take the -o basename and cannot be resolved); the object is discarded.
+    if ! swiftc -wmo -module-name SpeedySpaces \
+        -target "${arch}-apple-macos${deploy_target}" \
+        -import-objc-header "$src/CGSPrivate.h" \
+        -framework AppKit -framework ServiceManagement -framework Carbon -framework AppIntents \
+        -emit-const-values-path "$obj/SpeedySpaces.swiftconstvalues" \
+        -Xfrontend -const-gather-protocols-file -Xfrontend "$obj/appintents-protocols.json" \
+        -c -o "$obj/appintents-const.o" \
+        "$src"/*.swift 2>/dev/null
+    then
+        echo "    App Intents: const-values pass failed — skipping"
+        return 0
+    fi
+
+    ls "$src"/*.swift >"$obj/appintents-sources.txt"
+    echo "$obj/SpeedySpaces.swiftconstvalues" >"$obj/appintents-constvals.txt"
+    if "$tc/usr/bin/appintentsmetadataprocessor" \
+        --toolchain-dir "$tc" --sdk-root "$sdk" --module-name SpeedySpaces \
+        --target-triple "${arch}-apple-macos${deploy_target}" \
+        --deployment-target "$deploy_target" --platform-family macOS --xcode-version "$xcv" \
+        --source-file-list "$obj/appintents-sources.txt" \
+        --swift-const-vals-list "$obj/appintents-constvals.txt" \
+        --output "$APP_PATH/Contents/Resources" >/dev/null 2>&1
+    then
+        echo "    App Intents: Metadata.appintents written"
+    else
+        echo "    App Intents: extractor failed — skipping"
+    fi
+}
+
+mkdir -p "$BUILD_DIR"
+
+if [[ $WANT_SIGN -eq 1 ]]; then
+    build_app
+    sign_and_notarize
+elif [[ $WANT_DMG -eq 1 ]]; then
+    build_app
+    make_dmg
+elif [[ -z "$PUBLISH_VERSION" ]]; then
+    build_app
 fi
 
-# Sign with a STABLE identity if provided, so macOS remembers the Accessibility grant
-# across rebuilds. Ad-hoc signatures change every build, which makes the system forget
-# the grant and re-prompt on every launch — set SIGN_IDENTITY to avoid that.
-#   SIGN_IDENTITY="Apple Development: you@example.com"  ./build.sh
-# (Run `security find-identity -v -p codesigning` to list available identities.)
-SIGN="${SIGN_IDENTITY:-}"
-if [ -z "$SIGN" ]; then
-    # Default to a stable Apple Development identity when one exists: ad-hoc signatures
-    # change every build, which makes macOS silently drop the Accessibility grant — and
-    # with it space switching AND the Mission Control dismissal watch.
-    # Use the certificate hash — common names can be ambiguous (multiple certs).
-    SIGN=$(security find-identity -v -p codesigning 2>/dev/null \
-        | awk '/Apple Development/ {print $2; exit}')
-fi
-SIGN="${SIGN:--}"
-if [ "$SIGN" = "-" ]; then
-    echo "==> Ad-hoc code signing (grant will NOT persist across rebuilds)"
-else
-    echo "==> Code signing with identity: $SIGN"
-fi
-codesign --force --sign "$SIGN" \
-    --entitlements "$ROOT/SpeedySpaces.entitlements" \
-    --options runtime \
-    "$APP" 2>/dev/null || \
-codesign --force --sign "$SIGN" \
-    --entitlements "$ROOT/SpeedySpaces.entitlements" \
-    "$APP"
-
-echo "==> Built $APP"
-
-# --- DMG for distribution (skip with DMG=0 ./build.sh) ---
-# Contains the app plus an /Applications symlink for drag-to-install. Note: without a
-# Developer ID signature + notarization, downloaders must right-click > Open (or clear
-# the quarantine flag) on first launch — Gatekeeper blocks unnotarized downloads.
-if [ "${DMG:-1}" != "0" ]; then
-    VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo dev)"
-    DMG_PATH="$BUILD/SpeedySpaces-$VERSION.dmg"
-    STAGING="$BUILD/dmg-staging"
-    echo "==> Packaging $DMG_PATH"
-    rm -rf "$STAGING" "$DMG_PATH"
-    mkdir -p "$STAGING"
-    cp -R "$APP" "$STAGING/"
-    ln -s /Applications "$STAGING/Applications"
-    hdiutil create -volname "SpeedySpaces" -srcfolder "$STAGING" \
-        -format UDZO -ov -quiet "$DMG_PATH"
-    rm -rf "$STAGING"
-    echo "==> Built $DMG_PATH"
+if [[ -n "$PUBLISH_VERSION" ]]; then
+    publish
 fi
 
-# If SpeedySpaces is already running, relaunch so this fresh build takes over. macOS `open` won't
-# relaunch a running LSUIElement agent — it just re-activates the old one — so a rebuild would
-# otherwise keep running stale code. `open -n` forces a new instance; the app terminates the
-# stale one on launch (newest wins).
-if pgrep -f "SpeedySpaces.app/Contents/MacOS/SpeedySpaces" >/dev/null 2>&1; then
-    echo "==> Relaunching (replacing the running instance)"
-    open -n "$APP"
-fi
-
-echo "    Run with: open \"$APP\"   (or) \"$APP/Contents/MacOS/SpeedySpaces\""
+exit 0

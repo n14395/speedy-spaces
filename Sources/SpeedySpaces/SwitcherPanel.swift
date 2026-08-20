@@ -227,7 +227,6 @@ final class SwitcherBarView: NSView {
     /// Click on a tile's name row (above) or "Desktop N" caption (below) — opens the
     /// name/icon editor, same as the pencil in the menu-bar list.
     var onNameClick: ((Int) -> Void)?
-    var onHoverChanged: ((Bool) -> Void)?
 
     // MARK: - Drag-to-reorder
 
@@ -480,18 +479,10 @@ final class SwitcherBarView: NSView {
 
     // MARK: - Mouse
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        guard layout.barRect.width > 0 else { return }
-        addTrackingArea(NSTrackingArea(rect: layout.barRect,
-                                       options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways],
-                                       owner: self, userInfo: nil))
-    }
-
-    override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
-
-    override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
+    // No tracking areas: enter/exit are only delivered while the window accepts mouse
+    // events, and the panel is click-through except when the pointer is over the band —
+    // a state the panel's own pointer watch flips on a 100 ms poll. That made exits
+    // unreliable (see SwitcherPanel.startPointerWatch), so hover is polled there instead.
 
     /// A press records the tile under the pointer but commits to nothing — `mouseUp`
     /// decides click, and `mouseDragged` promotes to a drag past the threshold. AppKit
@@ -768,6 +759,9 @@ final class SwitcherPanel: NSPanel {
     private var pointerWatch: Timer?
     /// Last polled global cursor location, for detecting MOVEMENT over the band (vs mere presence).
     private var lastPointerLoc: NSPoint?
+    /// Whether the last poll found the pointer over the band, so both edges of the hover
+    /// report come from the same place.
+    private var pointerInBand = false
     /// Fired from the pointer watch when the cursor actually moves over the band — lets the HUD pin
     /// a flash on active hover only, never under a cursor that merely rests where the flash appears.
     var onBandPointerMoved: (() -> Void)?
@@ -778,9 +772,8 @@ final class SwitcherPanel: NSPanel {
     var onNameClick: ((Int) -> Void)? {
         get { barView.onNameClick } set { barView.onNameClick = newValue }
     }
-    var onHoverChanged: ((Bool) -> Void)? {
-        get { barView.onHoverChanged } set { barView.onHoverChanged = newValue }
-    }
+    /// Pointer entered / left the band, as seen by `pointerWatch`.
+    var onHoverChanged: ((Bool) -> Void)?
     var onDragBegan: ((Int, NSPoint) -> Void)? {
         get { barView.onDragBegan } set { barView.onDragBegan = newValue }
     }
@@ -893,6 +886,16 @@ final class SwitcherPanel: NSPanel {
         startPointerWatch()
     }
 
+    /// Push this panel's pixels to the window server NOW, instead of at the run loop's
+    /// end-of-turn commit. Used when a space transition is about to start on this same turn:
+    /// a window the server hasn't composited by the time the slide begins stays invisible
+    /// until it ends, which is exactly what anticipating the switch is meant to avoid.
+    func flushToScreen() {
+        guard isPresented else { return }
+        contentView?.displayIfNeeded()
+        CATransaction.flush()
+    }
+
     private func startPointerWatch() {
         guard pointerWatch == nil else { return }
         lastPointerLoc = NSEvent.mouseLocation
@@ -917,6 +920,16 @@ final class SwitcherPanel: NSPanel {
                 self.onBandPointerMoved?()
             }
             self.lastPointerLoc = loc
+            // Both edges of the hover pin come from this poll. The pin is ENGAGED here
+            // (onBandPointerMoved), so its release has to be too: AppKit only delivers
+            // mouseExited while the panel is accepting mouse events, and the very next line
+            // flips acceptance back off the moment the pointer leaves. A pointer that swept
+            // across the band pinned the flash and the matching exit never arrived — the HUD
+            // then stayed up until a later hover happened to produce one.
+            if inBand != self.pointerInBand {
+                self.pointerInBand = inBand
+                self.onHoverChanged?(inBand)
+            }
             if self.ignoresMouseEvents == inBand {
                 self.ignoresMouseEvents = !inBand
                 self.barView.needsDisplay = true
@@ -928,6 +941,7 @@ final class SwitcherPanel: NSPanel {
         pointerWatch?.invalidate()
         pointerWatch = nil
         lastPointerLoc = nil
+        pointerInBand = false
         ignoresMouseEvents = true
     }
 
@@ -1000,7 +1014,6 @@ final class SwitcherPanel: NSPanel {
         backdrop.layer?.cornerRadius = popover ? SwitcherLayout.popoverCornerRadius : 0
         backdrop.layer?.cornerCurve = .continuous
         backdrop.layer?.masksToBounds = popover
-        barView.updateTrackingAreas()
         barView.needsDisplay = true
     }
 }
