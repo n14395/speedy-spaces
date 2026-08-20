@@ -8,6 +8,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     private let strip = MenuBarStripView()
     private var editor: SpaceEditorController?
+    /// In-flight "switch to the space, then open its editor" request (see presentEditor).
+    private var pendingEditorObserver: NSObjectProtocol?
+    private var pendingEditorBackstop: DispatchWorkItem?
     private var settings: SettingsController?
 
     init(spaces: SpacesManager, store: MetadataStore) {
@@ -268,7 +271,59 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Open the name/icon editor for `uuid` (a row's pencil affordance, the
     /// rename-current-space hotkey, or a clicked label/title — `screen` then pins the
     /// editor to the display where the click happened).
+    ///
+    /// The editor is an ordinary window, so it materialises on whichever space is current when
+    /// it's ordered front — renaming a space you aren't standing on used to drop the panel on
+    /// the wrong desktop. So land on the target space FIRST and only reveal the editor once the
+    /// switch has been verified.
     func presentEditor(uuid: String, on screen: NSScreen? = nil) {
+        guard let space = spaces.spaces.first(where: { $0.uuid == uuid }) else { return }
+        cancelPendingEditor()   // last rename request wins
+        // A space belongs to exactly one display, and the editor has to open on THAT display —
+        // centring it on any other screen would put it on that screen's current space, which is
+        // not the space being renamed. Fall back to the caller's screen if the match fails.
+        let target = displayScreen(for: space) ?? screen
+        guard !space.isCurrent else { return showEditor(uuid: uuid, on: target) }
+
+        var revealed = false
+        let reveal = { [weak self] in
+            guard let self, !revealed else { return }
+            revealed = true
+            self.cancelPendingEditor()
+            self.showEditor(uuid: uuid, on: target)
+        }
+        // The verifier publishes exactly one outcome per switch — landed or gave up — and a
+        // refused switch publishes synchronously from inside switchTo, so subscribe first.
+        pendingEditorObserver = NotificationCenter.default.addObserver(
+            forName: .speedySpacesSwitchOutcome, object: nil, queue: .main) { _ in reveal() }
+        // Safety net so a rename the user asked for is never swallowed outright. Sized to clear
+        // the slowest path that still reports: a Show-Desktop dismissal defers the real switch
+        // by ~1.1 s and only then starts the verifier (whose own idle timeout is 2 s).
+        let backstop = DispatchWorkItem { reveal() }
+        pendingEditorBackstop = backstop
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: backstop)
+        // `true` means in flight (including the deferred Show-Desktop retry) — wait for the
+        // outcome. `false` is an outright refusal, already published above; don't stall on it.
+        if !spaces.switchTo(space) { reveal() }
+    }
+
+    private func cancelPendingEditor() {
+        if let observer = pendingEditorObserver { NotificationCenter.default.removeObserver(observer) }
+        pendingEditorObserver = nil
+        pendingEditorBackstop?.cancel()
+        pendingEditorBackstop = nil
+    }
+
+    /// The screen a space lives on, matched through its CGS display identifier.
+    private func displayScreen(for space: Space) -> NSScreen? {
+        NSScreen.screens.first {
+            SwitcherHUD.displayIdentifiers(for: $0).contains(space.displayIdentifier)
+        }
+    }
+
+    /// Build and show the editor. Re-resolves the space so the title reflects any change the
+    /// switch caused between the request and the reveal.
+    private func showEditor(uuid: String, on screen: NSScreen?) {
         guard let space = spaces.spaces.first(where: { $0.uuid == uuid }) else { return }
         editor = SpaceEditorController(
             uuid: uuid,
