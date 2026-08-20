@@ -1325,13 +1325,13 @@ extension SettingsController {
         ]))
         subTabs.addTabViewItem(subTab("Switching Workspaces",
             [globalRow]
-            + (1...10).map { switchingRow(SystemShortcuts.desktopBaseID + $0 - 1, "Switch to Space \($0)") }
+            + (1...12).map { switchingRow(SystemShortcuts.desktopBaseID + $0 - 1, "Switch to Space \($0)") }
             + [switchingRow(SystemShortcuts.moveRightID, "Next Space"),
                switchingRow(SystemShortcuts.moveLeftID, "Previous Space"),
                shortcutRow(.backAndForth)]))
         subTabs.addTabViewItem(subTab("Moving Windows",
             [extraRow]
-            + (1...10).map { moveRow(HotkeyAction(rawValue: "moveFollowToSpace\($0)")!) }
+            + (1...12).map { moveRow(HotkeyAction(rawValue: "moveFollowToSpace\($0)")!) }
             + [moveRow(.moveFollowNext), moveRow(.moveFollowPrev)]))
         subTabs.addTabViewItem(subTab("Displays", [
             shortcutRow(.moveDisplayNext),

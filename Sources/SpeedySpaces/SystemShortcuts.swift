@@ -100,11 +100,15 @@ enum SystemShortcuts {
         case moveLeftID + 1:  return DefaultChord(keyChar: 65535, keyCode: 123, mods: ctrl | shift | fn)
         case moveRightID:     return DefaultChord(keyChar: 65535, keyCode: 124, mods: ctrl | fn)
         case moveRightID + 1: return DefaultChord(keyChar: 65535, keyCode: 124, mods: ctrl | shift | fn)
-        case desktopBaseID...(desktopBaseID + 9):
-            // ⌃1..⌃9, ⌃0 — (ascii digit, ANSI digit-row virtual key).
-            let digits: [(char: Int, vk: Int)] = [(49, 18), (50, 19), (51, 20), (52, 21), (53, 23),
-                                                  (54, 22), (55, 26), (56, 28), (57, 25), (48, 29)]
-            let d = digits[id - desktopBaseID]
+        case desktopBaseID...(desktopBaseID + 11):
+            // ⌃1..⌃9, ⌃0, then ⌃- and ⌃= for Desktops 11 and 12 — carrying macOS's own
+            // digit-row run onto the two keys that continue that row past "0". macOS itself
+            // assigns no chord beyond Desktop 10 (see seedExtraDesktopChordsIfNeeded).
+            // (ascii char, ANSI virtual key).
+            let keys: [(char: Int, vk: Int)] = [(49, 18), (50, 19), (51, 20), (52, 21), (53, 23),
+                                                (54, 22), (55, 26), (56, 28), (57, 25), (48, 29),
+                                                (45, 27), (61, 24)]
+            let d = keys[id - desktopBaseID]
             return DefaultChord(keyChar: d.char, keyCode: d.vk, mods: ctrl)
         default: return nil
         }
@@ -188,10 +192,11 @@ enum SystemShortcuts {
     }
 
     /// The switching symbolic-hotkey ids the Global Modifier governs, each paired with the
-    /// natural key its auto-assignment uses: Switch-to-Desktop 1…10 (digit keys) + Move-right/left
-    /// (→ / ←). Order matches the Settings rows (Space 1…10, then Next, then Previous).
+    /// natural key its auto-assignment uses: Switch-to-Desktop 1…12 (digit row, then - and =)
+    /// + Move-right/left (→ / ←). Order matches the Settings rows (Space 1…12, then Next,
+    /// then Previous).
     static var switchingIDKeys: [(id: Int, keyCode: UInt16)] {
-        var out: [(Int, UInt16)] = (0..<10).map {
+        var out: [(Int, UInt16)] = (0..<12).map {
             (desktopBaseID + $0, UInt16(defaultChord(id: desktopBaseID + $0)?.keyCode ?? 0))
         }
         out += [(moveRightID, 124), (moveLeftID, 123)]   // Next → , Previous ←
@@ -228,6 +233,30 @@ enum SystemShortcuts {
                   (entry["enabled"] as? Bool) == false else { continue }
             entry["enabled"] = true
             hotkeys[key] = entry
+            applyLive(id: id, entry: entry)
+            changed = true
+        }
+        if changed { writeHotkeys(hotkeys) }
+    }
+
+    /// macOS ships Desktops 11-16 as symbolic-hotkey entries that are *enabled but chordless*
+    /// (only 1…10 get ⌃1…⌃0), so Space 11/12 would show an empty row and their keys would do
+    /// nothing. Write the factory ⌃- / ⌃= once — and only where there is no chord at all, so a
+    /// chord the user set themselves is never clobbered. One-time, like `reenableSpacesSet`.
+    static func seedExtraDesktopChordsIfNeeded() {
+        let flag = "didSeedDesktop11And12Chords"
+        guard !UserDefaults.standard.bool(forKey: flag) else { return }
+        UserDefaults.standard.set(true, forKey: flag)
+        var hotkeys = readHotkeys()
+        var changed = false
+        for n in 11...12 {
+            let id = desktopBaseID + n - 1
+            // Test for `parameters` rather than parseShortcut: that returns nil for a *disabled*
+            // entry too, and a disabled entry still carries a chord we must not overwrite.
+            let value = domainEntry(id: id)?["value"] as? [String: Any]
+            guard (value?["parameters"] as? [Int]) == nil, let entry = defaultEntry(id: id)
+            else { continue }
+            hotkeys[String(id)] = entry
             applyLive(id: id, entry: entry)
             changed = true
         }

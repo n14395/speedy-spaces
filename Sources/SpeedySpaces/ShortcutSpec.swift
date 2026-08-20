@@ -139,6 +139,7 @@ enum HotkeyAction: String, CaseIterable {
     case moveFollowToSpace1, moveFollowToSpace2, moveFollowToSpace3, moveFollowToSpace4
     case moveFollowToSpace5, moveFollowToSpace6, moveFollowToSpace7, moveFollowToSpace8
     case moveFollowToSpace9, moveFollowToSpace10
+    case moveFollowToSpace11, moveFollowToSpace12
     case moveFollowNext, moveFollowPrev
     case moveDisplayNext, moveDisplayPrev
     case openMenu, openMissionControl, openSettings, renameCurrentSpace
@@ -181,7 +182,10 @@ enum HotkeyAction: String, CaseIterable {
     /// binding ships unset.
     var placeholderSuggestion: String? {
         if let n = spaceNumber {
-            let digit = n == 10 ? "0" : String(n)
+            // The digit row, continued onto - and = for Spaces 11 and 12.
+            let keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "="]
+            guard n >= 1, n <= keys.count else { return nil }
+            let digit = keys[n - 1]
             if rawValue.hasPrefix("switchToSpace") { return "⌥\(digit)" }
             if rawValue.hasPrefix("moveFollowToSpace") { return "⌥⇧\(digit)" }
             return nil
@@ -318,7 +322,7 @@ extension HotkeyAction {
     static func selfChecks(_ check: SelfTest.Check) {
         let ids = HotkeyAction.allCases.map(\.rawValue)
         check(Set(ids).count == ids.count, "actions: rawValues unique")
-        check(HotkeyAction.allCases.count == 32, "actions: case count stable (32)")
+        check(HotkeyAction.allCases.count == 34, "actions: case count stable (34)")
         // Persistence-id pin: renaming any case must fail this test.
         let pinned = [
             "switchToSpace1", "switchToSpace2", "switchToSpace3", "switchToSpace4",
@@ -328,7 +332,7 @@ extension HotkeyAction {
             "moveFollowToSpace1", "moveFollowToSpace2", "moveFollowToSpace3",
             "moveFollowToSpace4", "moveFollowToSpace5", "moveFollowToSpace6",
             "moveFollowToSpace7", "moveFollowToSpace8", "moveFollowToSpace9",
-            "moveFollowToSpace10",
+            "moveFollowToSpace10", "moveFollowToSpace11", "moveFollowToSpace12",
             "moveFollowNext", "moveFollowPrev",
             "moveDisplayNext", "moveDisplayPrev",
             "openMenu", "openMissionControl", "openSettings", "renameCurrentSpace",

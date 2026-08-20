@@ -88,6 +88,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.terminateOtherInstances()  // newest launch wins — a rebuild's binary replaces a stale one
         Prefs.seedDefaultShortcutsIfNeeded()   // ship default app-owned chords before the first reload
+        // Spaces 11/12 have no macOS-assigned chord; give them ⌃- / ⌃= before the reload so the
+        // Move rows can derive ⌃⇧- / ⌃⇧= from them.
+        SystemShortcuts.seedExtraDesktopChordsIfNeeded()
         statusController = StatusItemController(spaces: spaces, store: store)
         if let statusController {
             hotkeys = HotkeyManager(spaces: spaces, store: store, status: statusController)
