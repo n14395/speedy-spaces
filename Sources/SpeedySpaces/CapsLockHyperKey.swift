@@ -1,7 +1,9 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// Caps Lock → a configurable modifier set while held (Settings: "Map Caps Lock to:",
+/// RETIRED FEATURE — no Settings control remains; `Prefs.capsLockHyperKey` is hard-false
+/// so `apply()` only ever tears the mapping down. Kept so an enabled machine cleans up.
+/// Caps Lock → a configurable modifier set while held (was Settings: "Map Caps Lock to:",
 /// default ⌘⌥⌃ — the "hyper key"), like Karabiner-Elements' classic
 /// caps_lock-to-modifiers complex modification. Any modifier left OUT of the mapping
 /// layers on top physically — with the default, Caps Lock+K and Caps Lock+⇧+K are two

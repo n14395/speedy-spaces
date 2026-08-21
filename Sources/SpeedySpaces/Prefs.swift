@@ -184,13 +184,18 @@ enum Prefs {
     /// What the hold-to-show chord presents.
     enum SwitcherStyle: String {
         case hud            // the app's own floating bar
-        case missionControl // real Mission Control, spaces bar auto-expanded
+        case missionControl // RETIRED: real Mission Control, spaces bar auto-expanded
     }
 
     /// Pure resolver for the stored style + legacy bool from the two-style era.
+    ///
+    /// `.missionControl` was removed as a user-selectable type; the case remains only so
+    /// stored configurations still decode. It always resolves to `.hud` now, so a machine
+    /// that had it selected isn't stranded on a style with no control left to change it.
     static func switcherStyle(fromStored raw: String?, legacyBool: Bool?) -> SwitcherStyle {
-        if let raw, let style = SwitcherStyle(rawValue: raw) { return style }
-        return (legacyBool ?? false) ? .missionControl : .hud
+        _ = legacyBool
+        if let raw, let style = SwitcherStyle(rawValue: raw), style != .missionControl { return style }
+        return .hud
     }
 
     static var switcherStyle: SwitcherStyle {
@@ -333,7 +338,8 @@ enum Prefs {
     // One decomposed key pair per action (absent keyCode = unset — all bindings are
     // opt-in). Per-space bindings live in SpaceMetadata, not here.
 
-    /// The modifier set Caps Lock maps to while held (Settings: "Map Caps Lock to:").
+    /// The modifier set Caps Lock maps to while held. RETIRED with capsLockHyperKey —
+    /// retained only so a stored value survives, and for the self-tests of flags(fromMapping:).
     /// Sanitized NSEvent bits; default ⌘⌥⌃. 0 = caps injects nothing while remapped.
     static var capsLockMapping: UInt {
         get {
@@ -348,15 +354,13 @@ enum Prefs {
         }
     }
 
-    /// While held, Caps Lock acts as the `capsLockMapping` modifiers — see
-    /// CapsLockHyper. Default on.
-    static var capsLockHyperKey: Bool {
-        get { defaults.object(forKey: "capsLockHyperKey") as? Bool ?? true }
-        set {
-            defaults.set(newValue, forKey: "capsLockHyperKey")
-            NotificationCenter.default.post(name: .speedySpacesPrefsChanged, object: nil)
-        }
-    }
+    /// RETIRED: Caps Lock remapping was removed as a feature; the control is gone from
+    /// Settings. This now always reads false, which matters for cleanup rather than
+    /// behaviour: the remap is a SYSTEM-WIDE `hidutil` UserKeyMapping (Caps Lock → F18)
+    /// that outlives the app, so `CapsLockHyper.apply()` must still run at launch and take
+    /// the `deactivate()` branch to tear it down. Without that, a machine that had the
+    /// feature on would be left with a dead Caps Lock and no control to fix it.
+    static var capsLockHyperKey: Bool { false }
 
     // MARK: - Global modifier (Switching Workspaces)
 

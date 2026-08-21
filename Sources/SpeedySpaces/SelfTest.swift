@@ -57,14 +57,14 @@ enum SelfTest {
         check(WorkspaceListStyle.migrating(fromStored: "icons") == .icons, "workspace list: keep icons")
         check(Prefs.switcherStyle(fromStored: nil, legacyBool: nil) == .hud,
               "switcher style: default hud")
-        check(Prefs.switcherStyle(fromStored: nil, legacyBool: true) == .missionControl,
-              "switcher style: legacy bool true -> missionControl")
+        check(Prefs.switcherStyle(fromStored: nil, legacyBool: true) == .hud,
+              "switcher style: legacy bool true -> hud (missionControl retired)")
         check(Prefs.switcherStyle(fromStored: nil, legacyBool: false) == .hud,
               "switcher style: legacy bool false -> hud")
         check(Prefs.switcherStyle(fromStored: "hud", legacyBool: true) == .hud,
               "switcher style: stored string outranks legacy bool")
-        check(Prefs.switcherStyle(fromStored: "missionControl", legacyBool: nil) == .missionControl,
-              "switcher style: stored missionControl kept")
+        check(Prefs.switcherStyle(fromStored: "missionControl", legacyBool: nil) == .hud,
+              "switcher style: stored missionControl -> hud (retired)")
         check(Prefs.switcherStyle(fromStored: "bogus", legacyBool: nil) == .hud,
               "switcher style: unknown stored -> default")
         check(Prefs.thumbnailIconStyle(fromStored: nil, legacyIcons: nil, legacyLabels: nil) == .beforeName,

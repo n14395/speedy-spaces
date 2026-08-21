@@ -25,7 +25,6 @@ final class SettingsController: NSWindowController {
     private weak var mcBoldToggle: NSButton?
     private var mcIconCards: [IconStyleCardView] = []
     private weak var mcIconHint: NSTextField?
-    private weak var capsMappingRecorder: ShortcutRecorderView?
     private weak var globalModifierToggle: NSButton?
     private weak var globalModifierRecorder: ShortcutRecorderView?
     private weak var moveExtraToggle: NSButton?
@@ -421,8 +420,7 @@ final class SettingsController: NSWindowController {
         holdBlock.alignment = .leading
         holdBlock.spacing = 6
 
-        // 3. Type selector: a heading, then three same-level choices. The first two are the
-        // app's own floating bar in two positions; the third hands off to real Mission Control.
+        // 3. Type selector: a heading, then the two positions of the app's own floating bar.
         let typeLabel = NSTextField(labelWithString: "Type")
         typeLabel.font = .boldSystemFont(ofSize: 13)
         let typeMimic = NSButton(radioButtonWithTitle: "Mimic Mission Control",
@@ -435,16 +433,11 @@ final class SettingsController: NSWindowController {
         typePopover.tag = 1
         typePopover.toolTip = "The app's own bar as a centered panel hugging the thumbnails, "
             + "up to 80% of the screen width — beyond that the thumbnails shrink."
-        let typeNative = NSButton(radioButtonWithTitle: "Native Mission Control",
-                                  target: self, action: #selector(changeSwitcherType(_:)))
-        typeNative.tag = 2
-        typeNative.toolTip = "Opens the real Mission Control and expands its spaces bar into thumbnails."
-        switch (Prefs.switcherStyle, Prefs.switcherPosition) {
-        case (.missionControl, _):   typeNative.state = .on
-        case (.hud, .classicPopover): typePopover.state = .on
-        default:                      typeMimic.state = .on   // (.hud, .mimicMissionControl)
-        }
-        let typeRadios = NSStackView(views: [typeMimic, typePopover, typeNative])
+        // A config stored from the retired "Native Mission Control" style resolves to .hud
+        // (see Prefs.switcherStyle), so only the two positions can be selected here.
+        if Prefs.switcherPosition == .classicPopover { typePopover.state = .on }
+        else { typeMimic.state = .on }
+        let typeRadios = NSStackView(views: [typeMimic, typePopover])
         typeRadios.orientation = .vertical
         typeRadios.alignment = .leading
         typeRadios.spacing = 6
@@ -454,8 +447,7 @@ final class SettingsController: NSWindowController {
         let note = NSTextField(wrappingLabelWithString:
             "Shows your workspaces as thumbnails — briefly whenever the active workspace "
             + "changes, and/or for as long as you hold the chosen key (enable either above). "
-            + "“Mimic Mission Control” and “Classic Popover” draw the app's own bar; "
-            + "“Native Mission Control” opens the real Mission Control with its spaces bar expanded. "
+            + "“Mimic Mission Control” and “Classic Popover” are two positions for the app's own bar. "
             + "The names, icons and bold weight on the thumbnails are set in the Thumbnails tab.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
@@ -666,16 +658,8 @@ final class SettingsController: NSWindowController {
     /// tag 0 = the app's bar in the Mission Control position, tag 1 = the app's bar as a
     /// centered popover, tag 2 = the real Mission Control.
     @objc private func changeSwitcherType(_ sender: NSButton) {
-        switch sender.tag {
-        case 2:
-            Prefs.switcherStyle = .missionControl
-        case 1:
-            Prefs.switcherStyle = .hud
-            Prefs.switcherPosition = .classicPopover
-        default:
-            Prefs.switcherStyle = .hud
-            Prefs.switcherPosition = .mimicMissionControl
-        }
+        Prefs.switcherStyle = .hud
+        Prefs.switcherPosition = sender.tag == 1 ? .classicPopover : .mimicMissionControl
     }
 
     @objc private func toggleFollowDisplay(_ sender: NSButton) {
@@ -1240,24 +1224,7 @@ extension SettingsController {
             return well
         }
 
-        // --- Caps Lock mapping ----------------------------------------------------
-        let hyperToggle = NSButton(checkboxWithTitle: "Map Caps Lock to:",
-                                   target: self, action: #selector(toggleCapsLockHyper(_:)))
-        hyperToggle.state = Prefs.capsLockHyperKey ? .on : .off
-        hyperToggle.toolTip = "While held, Caps Lock acts as the modifiers recorded here "
-            + "(default ⌘+⌥+⌃) — a conflict-free extra modifier for your shortcuts (and any "
-            + "other app's). Caps Lock no longer toggles capitals while this is on. Requires "
-            + "Accessibility."
-        let capsWell = modifierWell { [weak self] mods in
-            Prefs.capsLockMapping = mods
-            self?.refreshCapsLockUI()
-        }
-        self.capsMappingRecorder = capsWell
-        let capsRow = NSStackView(views: [hyperToggle, capsWell])
-        capsRow.orientation = .horizontal
-        capsRow.spacing = 8
-
-        // Hold-to-show switcher lives here (next to the Caps mapping), not in the App sub-tab.
+        // Hold-to-show switcher lives here, not in the App sub-tab.
         let holdRow = shortcutRow(.holdSwitcher)
 
         let intro = NSTextField(wrappingLabelWithString:
@@ -1348,11 +1315,10 @@ extension SettingsController {
             forName: .speedySpacesNativeShortcutsChanged, object: nil, queue: .main) { [weak self] _ in
             self?.refreshShortcutsPane()
         }
-        refreshCapsLockUI()
         refreshShortcutsPane()
 
         return makePane(label: "Shortcuts", symbol: "keyboard",
-                        views: [intro, capsRow, holdRow, subTabs, note])
+                        views: [intro, holdRow, subTabs, note])
     }
 
     /// A displayable spec for a symbolic-hotkey id's current binding (nil if it's disabled).
@@ -1426,17 +1392,7 @@ extension SettingsController {
         Prefs.hotkeyWrapAround = (sender.state == .on)
     }
 
-    @objc fileprivate func toggleCapsLockHyper(_ sender: NSButton) {
-        Prefs.capsLockHyperKey = (sender.state == .on)
-        refreshCapsLockUI()
-    }
-
     /// The mapping well shows the current caps mapping and only takes input while the
     /// checkbox is on.
-    fileprivate func refreshCapsLockUI() {
-        capsMappingRecorder?.isEnabled = Prefs.capsLockHyperKey
-        capsMappingRecorder?.spec = Prefs.capsLockMapping == 0 ? nil
-            : ShortcutSpec(keyCode: ShortcutSpec.noKeyCode, modifiers: Prefs.capsLockMapping)
-    }
 }
 

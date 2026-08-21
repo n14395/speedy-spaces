@@ -89,9 +89,18 @@ final class SwitcherHUD {
     /// Settings), cached and refreshed at most 1/min like `nativeSwitchChords`. Used to make
     /// those shortcuts wrap past the ends when `Prefs.hotkeyWrapAround` is on — matched
     /// however they're mapped, falling back to ⌃←/⌃→ (macOS's shipped default) when unset.
-    private var moveLeftChord = SystemShortcuts.SpaceShortcut(keyCode: 123, flags: .maskControl)
-    private var moveRightChord = SystemShortcuts.SpaceShortcut(keyCode: 124, flags: .maskControl)
-    private var directionalLoadedAt = Date.distantPast
+    /// The user's live macOS Move-left/right-a-space chords. The TAP THREAD reads these on
+    /// every arrow keypress, so they are a lock-guarded snapshot that MAIN refreshes — never
+    /// derived on the tap thread. Deriving them there meant a blocking cfprefsd round trip
+    /// (`persistentDomain(forName: "com.apple.symbolichotkeys")`, twice) inside an ACTIVE tap
+    /// callback, whose verdict gates keyboard delivery for the WHOLE login session: normally
+    /// 0.09 ms, but the window server recorded 21.9 s and 111 s stalls against these taps —
+    /// the "no shortcut or gesture switches spaces" freezes, which cleared on their own once
+    /// cfprefsd answered.
+    private let directionalChords = Locked<(left: SystemShortcuts.SpaceShortcut,
+                                            right: SystemShortcuts.SpaceShortcut)>(
+        (left: SystemShortcuts.SpaceShortcut(keyCode: 123, flags: .maskControl),
+         right: SystemShortcuts.SpaceShortcut(keyCode: 124, flags: .maskControl)))
     /// Throttle for the streaming dock-swipe gesture events (see nativeDockSwipe).
     private var lastDockSwipeFlash = Date.distantPast
     /// True while `barPointerMoved` holds a flash open under an actively-moving pointer.
@@ -172,6 +181,9 @@ final class SwitcherHUD {
         for s in spaces.spaces where s.isCurrent {
             lastCurrentByDisplay[s.displayIdentifier] = s.uuid
         }
+        NotificationCenter.default.addObserver(self, selector: #selector(refreshDirectionalChords),
+                                               name: .speedySpacesNativeShortcutsChanged, object: nil)
+        refreshDirectionalChords()   // seed before the tap can read the snapshot
         installNativeSwitchTap()
         wallpapers.scheduleRecord(spaces: { [weak self] in self?.spaces.spaces ?? [] })
         // Debug side door (`--show-switcher`, `--fire-hotkey holdSwitcher:*` routes here via
@@ -309,12 +321,12 @@ final class SwitcherHUD {
         // shortcut and carry the grabbed window; if we took those over here they'd become a
         // viewport-only switch and the window would stall mid-walk. Let them pass through.
         guard !WindowMover.standDownForMove else { return false }
-        reloadDirectionalChordsIfStale()
+        let chords = directionalChords.get()
         let relevant: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
         let flags = eventFlags.intersection(relevant)
         let forward: Bool
-        if keyCode == moveRightChord.keyCode, flags == moveRightChord.flags { forward = true }
-        else if keyCode == moveLeftChord.keyCode, flags == moveLeftChord.flags { forward = false }
+        if keyCode == chords.right.keyCode, flags == chords.right.flags { forward = true }
+        else if keyCode == chords.left.keyCode, flags == chords.left.flags { forward = false }
         else { return false }
         // Resolve the target against the (optimistically-updated) current space at run time,
         // so ordered async presses each see the previous one's advance. ⌃-arrows act on the
@@ -344,17 +356,14 @@ final class SwitcherHUD {
         guard Prefs.moveExtraModifierEnabled, Prefs.moveExtraModifier != 0 else { return false }
         // A titleBarDrag walk posts its own ⌃+fn+arrows (no extra modifier) — let those pass.
         guard !WindowMover.standDownForMove else { return false }
-        guard keyCode == moveLeftChord.keyCode || keyCode == moveRightChord.keyCode else { return false }
-        reloadDirectionalChordsIfStale()
+        let chords = directionalChords.get()
+        guard keyCode == chords.left.keyCode || keyCode == chords.right.keyCode else { return false }
         let relevant: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
         let extra = CGEventFlags(rawValue: UInt64(Prefs.moveExtraModifier))
         let flags = eventFlags.intersection(relevant)
-        HotkeyDiag.log("tap arrow keyCode=\(keyCode) saw=0x\(String(flags.rawValue, radix: 16)) "
-            + "wantL=0x\(String(moveLeftChord.flags.union(extra).rawValue, radix: 16)) "
-            + "wantR=0x\(String(moveRightChord.flags.union(extra).rawValue, radix: 16))")
         let forward: Bool
-        if keyCode == moveRightChord.keyCode, flags == moveRightChord.flags.union(extra) { forward = true }
-        else if keyCode == moveLeftChord.keyCode, flags == moveLeftChord.flags.union(extra) { forward = false }
+        if keyCode == chords.right.keyCode, flags == chords.right.flags.union(extra) { forward = true }
+        else if keyCode == chords.left.keyCode, flags == chords.left.flags.union(extra) { forward = false }
         else { return false }
         HotkeyDiag.log("switcher MOVE chord match keyCode=\(keyCode) forward=\(forward) — dispatching")
         DispatchQueue.main.async { [weak self] in
@@ -375,13 +384,17 @@ final class SwitcherHUD {
         return j == i ? nil : list[j]
     }
 
-    private func reloadDirectionalChordsIfStale() {
-        guard Date().timeIntervalSince(directionalLoadedAt) > 60 else { return }
-        directionalLoadedAt = Date()
-        moveLeftChord = SystemShortcuts.systemBinding(id: SystemShortcuts.moveLeftID)
+    /// Re-derive the directional chord snapshot the tap thread reads. MAIN THREAD ONLY —
+    /// this reads the symbolichotkeys defaults domain, which can block on cfprefsd. Driven
+    /// by `NativeShortcutsWatcher` (already polling that domain at 2 Hz on main and posting
+    /// `.speedySpacesNativeShortcutsChanged`), plus once at start, so the tap path never
+    /// pays for it.
+    @objc private func refreshDirectionalChords() {
+        let left = SystemShortcuts.systemBinding(id: SystemShortcuts.moveLeftID)
             ?? SystemShortcuts.SpaceShortcut(keyCode: 123, flags: .maskControl)
-        moveRightChord = SystemShortcuts.systemBinding(id: SystemShortcuts.moveRightID)
+        let right = SystemShortcuts.systemBinding(id: SystemShortcuts.moveRightID)
             ?? SystemShortcuts.SpaceShortcut(keyCode: 124, flags: .maskControl)
+        directionalChords.set((left: left, right: right))
     }
 
     /// keyDown from the tap (TAP THREAD): if the chord is one of the user's enabled macOS

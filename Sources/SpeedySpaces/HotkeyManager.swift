@@ -6,14 +6,33 @@ import Carbon.HIToolbox
 /// unobservable. Enable with `defaults write com.speedyspaces.SpeedySpaces hotkeyDebugLog
 /// -bool true` (and relaunch); lines append to /tmp/speedyspaces-hotkey-diag.log.
 enum HotkeyDiag {
+    /// Writes are handed to this serial queue and NEVER performed inline: several call
+    /// sites run on the event-tap thread, where an ACTIVE tap's callback gates keyboard
+    /// delivery for the whole login session — a blocking open/seek/write/close there
+    /// turns a busy disk into a session-wide input freeze (the same failure class as the
+    /// cfprefsd read removed from SwitcherHUD's chord path).
+    private static let queue = DispatchQueue(label: "speedyspaces.hotkeydiag", qos: .utility)
+    /// Read once: `UserDefaults.bool` is cheap but this is on the keystroke path.
+    private static let enabled = UserDefaults.standard.bool(forKey: "hotkeyDebugLog")
+    private static let stamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
     static func log(_ message: String) {
-        guard UserDefaults.standard.bool(forKey: "hotkeyDebugLog") else { return }
-        let line = "\(ProcessInfo.processInfo.processIdentifier) \(message)\n"
-        guard let d = line.data(using: .utf8) else { return }
-        if let h = FileHandle(forWritingAtPath: "/tmp/speedyspaces-hotkey-diag.log") {
-            h.seekToEndOfFile(); h.write(d); h.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: "/tmp/speedyspaces-hotkey-diag.log", contents: d)
+        guard enabled else { return }
+        // Timestamp at the CALL site (queue latency must not distort the ordering we read).
+        let now = Date()
+        let pid = ProcessInfo.processInfo.processIdentifier
+        queue.async {
+            let line = "\(stamp.string(from: now)) \(pid) \(message)\n"
+            guard let d = line.data(using: .utf8) else { return }
+            if let h = FileHandle(forWritingAtPath: "/tmp/speedyspaces-hotkey-diag.log") {
+                h.seekToEndOfFile(); h.write(d); h.closeFile()
+            } else {
+                FileManager.default.createFile(atPath: "/tmp/speedyspaces-hotkey-diag.log", contents: d)
+            }
         }
     }
 }

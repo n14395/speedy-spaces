@@ -449,9 +449,21 @@ final class SpacesManager {
     }
 
     /// Headless probe used by `--probe-switch`. Returns process exit code (0 pass, 1 fail).
+    ///
+    /// The engine override is TEMPORARY: this is a diagnostic run against a live session
+    /// (often the user's), and silently persisting `switchMethod` once left a machine
+    /// stranded on an engine that doesn't work on the running OS. The previous value is
+    /// restored on every exit path.
     func probeSwitch(method: SwitchMethod, index: Int) -> Int32 {
         refresh()
         guard index >= 0 && index < spaces.count else { print("FAIL bad index \(index)"); return 1 }
+        let previousMethod = Prefs.switchMethod
+        defer {
+            if Prefs.switchMethod != previousMethod {
+                Prefs.switchMethod = previousMethod
+                print("(restored switch engine: \(previousMethod))")
+            }
+        }
         Prefs.switchMethod = method
         let target = spaces[index]
         var result: Int32 = 1
