@@ -1,9 +1,8 @@
 import AppKit
 
-/// Serialises the "Move window to next/previous workspace" hotkeys for the title-bar-drag move
-/// method (Settings ▸ "Move windows using:" ▸ One window (native drag)).
+/// Serialises the "Move window to next/previous workspace" hotkeys.
 ///
-/// The move grabs the window's title bar and taps ⌃+fn+arrow; each grab must run to completion
+/// The move holds the window in a server-side drag and taps ⌃+fn+arrow; each grab must run to completion
 /// (grab → tap → release) uninterrupted. If a second press fired its own grab while the first was
 /// still mid-flight, the first walk's mouse-up would drop the drag the second still needed, so the
 /// later press only switched the space and left the window behind. We prevent that: the FIRST
@@ -13,8 +12,8 @@ import AppKit
 ///
 /// Main-thread only (driven from the hotkey dispatch); `busy`/`pendingSteps` are never touched off
 /// the main thread — the walk's completion hops back to main before calling `walkDidFinish`.
-final class TitleBarDragRelativeMover {
-    static let shared = TitleBarDragRelativeMover()
+final class RelativeWindowMover {
+    static let shared = RelativeWindowMover()
 
     private var wrap = false
     private weak var spaces: SpacesManager?
@@ -31,7 +30,7 @@ final class TitleBarDragRelativeMover {
     }
 
     /// Anchor on the focused window's current space, resolve `steps` away (wrapping per pref), and
-    /// run one title-bar-drag walk. Silently no-ops when there's no focused window or nowhere to go.
+    /// run one server-drag walk. Silently no-ops when there's no focused window or nowhere to go.
     private func start(steps: Int, spaces: SpacesManager) {
         guard let wid = try? WindowMover.focusedWindow().wid else { NSSound.beep(); return }
         spaces.refresh()
@@ -53,16 +52,20 @@ final class TitleBarDragRelativeMover {
         let jumpDesktop = (wrap && (raw < 0 || raw >= list.count)) ? target.ordinalOnDisplay + 1 : nil
 
         busy = true
-        HotkeyDiag.log("titleBarDragRelative: wid=\(wid) \(steps) step(s) -> space \(target.managedSpaceID)"
+        HotkeyDiag.log("relativeMove: wid=\(wid) \(steps) step(s) -> space \(target.managedSpaceID)"
             + (jumpDesktop != nil ? " (wrap → jump)" : ""))
         do {
-            try WindowMover.moveViaTitleBarDrag(wid: wid, target: target, spaces: spaces,
-                                                jumpDesktop: jumpDesktop) {
+            try WindowMover.moveViaServerDrag(wid: wid, target: target, spaces: spaces,
+                                              jumpDesktop: jumpDesktop) {
                 [weak self] in self?.walkDidFinish()
             }
+        } catch WindowMover.MoveError.screenRecordingRequired {
+            busy = false
+            pendingSteps = 0   // every queued press would hit the same wall
+            ScreenRecordingPermission.reportBlockedMove()
         } catch {
             busy = false
-            HotkeyDiag.log("titleBarDragRelative failed: \(error)")
+            HotkeyDiag.log("relativeMove failed: \(error)")
             drainPending()   // this batch produced no move; still honour queued presses
         }
     }

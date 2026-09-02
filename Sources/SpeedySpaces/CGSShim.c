@@ -24,17 +24,37 @@ CFArrayRef sm_copyManagedDisplaySpaces(CGSConnectionID cid) {
     return fn ? fn(cid) : NULL;
 }
 
-// Let CGDisplayHideCursor work from a background (accessory) app. Without this connection
-// property the hide is a no-op unless we're the foreground app; setting it lets our invisible
-// window-move grab hide the pointer while it drives the synthetic title-bar drag. Undocumented
-// but long-standing (CGSSetConnectionProperty + the "SetsCursorInBackground" key).
-typedef CGError (*SetConnPropFn)(CGSConnectionID, CGSConnectionID, CFStringRef, CFTypeRef);
-void sm_setsCursorInBackground(void) {
-    static SetConnPropFn fn = NULL; static int resolved = 0;
-    if (!resolved) { fn = (SetConnPropFn)dlsym(RTLD_DEFAULT, "CGSSetConnectionProperty"); resolved = 1; }
-    if (!fn) return;
-    CGSConnectionID cid = sm_mainConnectionID();
-    fn(cid, cid, CFSTR("SetsCursorInBackground"), kCFBooleanTrue);
+// --- Server-side window drag (the move-to-space grab) -----------------------
+// Hand the window server a window ID and let it drag THAT window under the mouse
+// button we currently hold down. This is the grab the "move a window to another
+// workspace" walk needs: macOS carries a window that is being dragged across each
+// space switch, and this names the window instead of hit-testing a click point, so
+// the title bar never has to be clickable — or even on screen.
+//
+// It is a different class of call from the discrete-teleport family
+// (CGSMoveWindow), which IS connection-gated to the caller's own windows and
+// silently no-ops on foreign ones. This one binds a window to a mouse press we
+// legitimately own, and the server allows that cross-process. Measured working on
+// macOS 27.0 (26A5421a) from a normal, Accessibility-granted, SIP-on process with
+// no Screen Recording grant.
+typedef CGError (*DragWindowRelFn)(CGSConnectionID, uint32_t, CGPoint);
+
+static DragWindowRelFn sm_resolveDragWindow(void) {
+    static DragWindowRelFn fn = NULL; static int resolved = 0;
+    if (!resolved) {
+        fn = (DragWindowRelFn)dlsym(RTLD_DEFAULT, "SLSDragWindowRelativeToMouse");
+        if (!fn) fn = (DragWindowRelFn)dlsym(RTLD_DEFAULT, "CGSDragWindowRelativeToMouse");
+        resolved = 1;
+    }
+    return fn;
+}
+
+bool sm_dragWindowAvailable(void) { return sm_resolveDragWindow() != NULL; }
+
+int32_t sm_dragWindowRelativeToMouse(uint32_t wid, CGPoint offset) {
+    DragWindowRelFn fn = sm_resolveDragWindow();
+    if (!fn) return -1;
+    return fn(sm_mainConnectionID(), wid, offset);
 }
 
 typedef CGError (*GetWindowBoundsFn)(CGSConnectionID, uint32_t, CGRect *);

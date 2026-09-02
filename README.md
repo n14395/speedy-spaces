@@ -69,6 +69,10 @@ verifiable with a built-in probe:
   schemes (e.g. one modifier + number jumps to that Space) and wrap-around stepping.
 - **Caps Lock hyper key**: map Caps Lock to a modifier set (default ⌘⌥⌃) while held —
   Karabiner's classic remap, without a virtual HID driver.
+- **Move windows between workspaces** — send the focused window to the next/previous
+  workspace or straight to a numbered one, following it there. The window is held in a
+  real window-server drag named by window ID, so it works whatever the title bar
+  contains and even when the window is parked off the edge of the display.
 - **macOS Shortcuts**: six App Intents (Switch to Space, Next/Previous Space, Show
   Switcher, Open Mission Control view, Rename Current Space).
 - **URL scheme**: `speedyspaces://switch?...`, `next`, `prev`, `back`, `switcher`,
@@ -86,7 +90,12 @@ verifiable with a built-in probe:
 - **Accessibility permission** (System Settings → Privacy & Security → Accessibility)
   for switching, hotkeys, and instant Mission Control dismissal detection. The app
   degrades gracefully without it.
-- Not sandboxed. No Screen Recording, no Input Monitoring, no SIP changes.
+- **Screen Recording permission** — *only* for moving windows between workspaces.
+  macOS hands a window over to be carried across a workspace switch only for an app
+  that holds this grant, and refuses silently otherwise. SpeedySpaces never captures
+  the screen; everything else works without it, and the app asks the first time you
+  use a move-window shortcut rather than at launch.
+- Not sandboxed. No Input Monitoring, no SIP changes.
 
 ## Build & run
 

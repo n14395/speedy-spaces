@@ -505,8 +505,8 @@ final class HotkeyManager {
             let forward = action == .moveFollowNext
             // Serialise grabs so a burst never overlaps (later presses would otherwise only
             // switch the space and leave the window behind); the batch glides in one grab.
-            TitleBarDragRelativeMover.shared.press(forward: forward,
-                                                   wrap: Prefs.hotkeyWrapAround, spaces: spaces)
+            RelativeWindowMover.shared.press(forward: forward,
+                                             wrap: Prefs.hotkeyWrapAround, spaces: spaces)
         default:
             guard let n = action.spaceNumber else { return }
             let isSwitch = action.rawValue.hasPrefix("switchToSpace")
@@ -526,6 +526,8 @@ final class HotkeyManager {
         do {
             try WindowMover.moveFocusedWindow(to: target, spaces: spaces)
             HotkeyDiag.log("moveWindow ok -> ordinal \(target.ordinalOnDisplay)")
+        } catch WindowMover.MoveError.screenRecordingRequired {
+            ScreenRecordingPermission.reportBlockedMove()
         } catch {
             NSSound.beep()
             HotkeyDiag.log("moveWindow FAILED: \(error)")

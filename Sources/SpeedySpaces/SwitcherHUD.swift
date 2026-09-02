@@ -225,7 +225,7 @@ final class SwitcherHUD {
                 if let tap = me.nativeTapRef.get() { me.nativeTapReviver.tapWasDisabled(tap) }
                 return Unmanaged.passUnretained(event)
             }
-            // A titleBarDrag walk posts its own ⌃+fn+arrows to drive the native "Move a space"
+            // A server-drag walk posts its own ⌃+fn+arrows to drive the native "Move a space"
             // shortcut and carry the grabbed window. Be fully transparent for the walk — don't
             // take the switch over, don't anticipate-flash — so nothing we do perturbs it.
             if WindowMover.standDownForMove { return Unmanaged.passUnretained(event) }
@@ -317,7 +317,7 @@ final class SwitcherHUD {
         // The wrap takeover EMULATES macOS's own Move-left/right-a-space shortcuts, so it only
         // runs when the user asked for wrapping; otherwise macOS handles ⌃-arrow natively.
         guard Prefs.hotkeyWrapAround else { return false }
-        // A titleBarDrag move posts its own ⌃+fn+arrows to drive the native "Move a space"
+        // A server-drag move posts its own ⌃+fn+arrows to drive the native "Move a space"
         // shortcut and carry the grabbed window; if we took those over here they'd become a
         // viewport-only switch and the window would stall mid-walk. Let them pass through.
         guard !WindowMover.standDownForMove else { return false }
@@ -354,7 +354,7 @@ final class SwitcherHUD {
     /// hotkey fires unimpeded either way.
     private func nativeDirectionalMoveHandled(keyCode: UInt16, eventFlags: CGEventFlags) -> Bool {
         guard Prefs.moveExtraModifierEnabled, Prefs.moveExtraModifier != 0 else { return false }
-        // A titleBarDrag walk posts its own ⌃+fn+arrows (no extra modifier) — let those pass.
+        // A server-drag walk posts its own ⌃+fn+arrows (no extra modifier) — let those pass.
         guard !WindowMover.standDownForMove else { return false }
         let chords = directionalChords.get()
         guard keyCode == chords.left.keyCode || keyCode == chords.right.keyCode else { return false }
@@ -368,8 +368,8 @@ final class SwitcherHUD {
         HotkeyDiag.log("switcher MOVE chord match keyCode=\(keyCode) forward=\(forward) — dispatching")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            TitleBarDragRelativeMover.shared.press(forward: forward,
-                                                   wrap: Prefs.hotkeyWrapAround, spaces: self.spaces)
+            RelativeWindowMover.shared.press(forward: forward,
+                                             wrap: Prefs.hotkeyWrapAround, spaces: self.spaces)
         }
         return true
     }
@@ -821,7 +821,7 @@ final class SwitcherHUD {
     }
 
     /// Main-thread tail of the drop tap. Only act while the switcher is held; ignore the
-    /// move's OWN synthetic grab events (titleBarDragInFlight) so a drop doesn't
+    /// move's OWN synthetic grab events (windowDragInFlight) so a drop doesn't
     /// re-trigger itself.
     private func handleDropEvent(type: CGEventType, cgLocation: CGPoint) {
         guard visibility == .held, !WindowMover.standDownForMove else { return }
@@ -838,6 +838,11 @@ final class SwitcherHUD {
     /// drag when the tap installs — left button already down — and seed the candidate from the
     /// window currently under the cursor, so the remaining drag/drop is tracked as usual.
     private func adoptInFlightDrag() {
+        // A move's own synthetic grab is a button-down too, and it lands wherever the cursor
+        // happens to be — so without this guard the switcher adopts whatever unrelated window
+        // is under the pointer as the drag candidate. (The old title-bar grab pressed ON the
+        // window being moved, which masked this.)
+        guard !WindowMover.standDownForMove else { return }
         guard dropCandidate == nil, NSEvent.pressedMouseButtons & 0x1 != 0 else { return }
         let ourPID = ProcessInfo.processInfo.processIdentifier
         let cg = CGEvent(source: nil)?.location ?? .zero   // current cursor, CG top-left
@@ -905,6 +910,8 @@ final class SwitcherHUD {
                 // band. Just pass the panels through for the move's synthetic re-grab (they
                 // self-restore via pointerWatch once the move ends).
                 for panel in self.panels.values { panel.suppressMouseForMove() }
+            } catch WindowMover.MoveError.screenRecordingRequired {
+                ScreenRecordingPermission.reportBlockedMove()
             } catch { NSSound.beep(); HotkeyDiag.log("windowDrop failed: \(error)") }
         }
     }

@@ -1,12 +1,12 @@
 import AppKit
 
-/// Moves a window to another space by simulating the native title-bar drag
-/// (`moveViaTitleBarDrag`) — macOS has no stock keyboard path for this, and the private
-/// window-server move calls silently no-op on this OS. The drag drives the native
-/// "Switch to Desktop N" chord, so the move always follows to the new space.
+/// Moves a window to another space with a server-side window drag (`moveViaServerDrag`) —
+/// macOS has no stock keyboard path for this, and the private window-server move calls
+/// silently no-op on this OS. The drag holds the window while the native "Switch to Desktop N"
+/// chord fires, so the move always follows to the new space.
 /// All failures throw a reason — callers log + beep rather than corrupting state.
 enum WindowMover {
-    /// True while a `titleBarDrag` walk is posting its synthetic ⌃+fn+arrows. The app's own
+    /// True while a `moveViaServerDrag` walk is posting its synthetic ⌃+fn+arrows. The app's own
     /// SwitcherHUD active tap head-inserts on the session tap, so it *sees* those events, and
     /// with wrap enabled it strips the fn bit and matches ⌃-arrow — swallowing the very event
     /// the walk posts and running a viewport-only `switchTo` that leaves the grabbed window
@@ -14,7 +14,7 @@ enum WindowMover {
     /// "Move a space" shortcut carries the window. Written from main/background and read from
     /// the event-tap thread — lock-guarded so no reader observes a torn value.
     private static let dragFlag = Locked(false)
-    static var titleBarDragInFlight: Bool {
+    static var windowDragInFlight: Bool {
         get { dragFlag.get() }
         set { dragFlag.set(newValue) }
     }
@@ -31,7 +31,7 @@ enum WindowMover {
     }
 
     /// The tap stands down for either our own move or a peer's.
-    static var standDownForMove: Bool { titleBarDragInFlight || externalMoveInFlight }
+    static var standDownForMove: Bool { windowDragInFlight || externalMoveInFlight }
 
     private static var peerObservers: [NSObjectProtocol] = []
     private static var peerClearWork: DispatchWorkItem?
@@ -64,6 +64,7 @@ enum WindowMover {
     enum MoveError: Error, CustomStringConvertible {
         case symbolsUnavailable
         case notTrusted
+        case screenRecordingRequired
         case noFocusedWindow
         case fullscreenTarget
         case sameSpace
@@ -73,6 +74,9 @@ enum WindowMover {
             switch self {
             case .symbolsUnavailable: return "window-move symbols unavailable on this macOS"
             case .notTrusted:         return "Accessibility not granted"
+            case .screenRecordingRequired:
+                return "Screen Recording not granted — the window server won't hand a window "
+                     + "over to be carried between workspaces without it"
             case .noFocusedWindow:    return "no focused window"
             case .fullscreenTarget:   return "can't move a window into a full-screen space"
             case .sameSpace:          return "window is already on the target space"
@@ -152,8 +156,8 @@ enum WindowMover {
         try move(wid: try focusedWindow().wid, to: target, spaces: spaces)
     }
 
-    /// Move a window to a SPECIFIC numbered `target` via the native title-bar drag (see
-    /// `moveViaTitleBarDrag`). This is the absolute "move to workspace N" path, so it jumps straight
+    /// Move a window to a SPECIFIC numbered `target` via the server-side drag (see
+    /// `moveViaServerDrag`). This is the absolute "move to workspace N" path, so it jumps straight
     /// there by driving the native "Switch to Desktop N" chord once (N = the target's position on
     /// its display), rather than walking ⌃+arrow. Works for FOREIGN windows on macOS 26+.
     static func move(wid: UInt32, to target: Space, spaces: SpacesManager) throws {
@@ -162,15 +166,15 @@ enum WindowMover {
         // space); the membership check catches the real no-op (already on the target).
         let targetID = UInt64(target.managedSpaceID)
         guard !spaceIDs(for: wid).contains(targetID) else { throw MoveError.sameSpace }
-        try moveViaTitleBarDrag(wid: wid, target: target, spaces: spaces,
-                                jumpDesktop: target.ordinalOnDisplay + 1)
+        try moveViaServerDrag(wid: wid, target: target, spaces: spaces,
+                              jumpDesktop: target.ordinalOnDisplay + 1)
     }
 
     // MARK: - Self-tests
 
     static func selfChecks(_ check: SelfTest.Check) {
-        let all: [MoveError] = [.symbolsUnavailable, .notTrusted, .noFocusedWindow,
-                                .fullscreenTarget, .sameSpace, .moveSilentlyFailed]
+        let all: [MoveError] = [.symbolsUnavailable, .notTrusted, .screenRecordingRequired,
+                                .noFocusedWindow, .fullscreenTarget, .sameSpace, .moveSilentlyFailed]
         check(all.allSatisfy { !$0.description.isEmpty }, "MoveError: every case has a description")
         check(Set(all.map(\.description)).count == all.count, "MoveError: descriptions distinct")
     }

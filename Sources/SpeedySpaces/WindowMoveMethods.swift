@@ -1,21 +1,31 @@
 import AppKit
 import ApplicationServices
 
-/// The "move window to workspace" mechanism: a synthetic native title-bar drag + Ctrl+fn+Arrow
-/// (the Hammerspoon technique). It works for FOREIGN windows on macOS 26+, where the raw CGS move
-/// calls are gated to the app's own windows. Relative bursts are serialised through
-/// `TitleBarDragRelativeMover`; the wrap-takeover interaction is guarded by
-/// `WindowMover.titleBarDragInFlight`.
+/// The "move window to workspace" mechanism: a server-side window drag + Ctrl+fn+Arrow.
+///
+/// macOS carries a window that is being *dragged* across every space switch, and that is the
+/// only route to moving a foreign window between spaces on macOS 26+ — the raw CGS move calls
+/// are connection-gated to the caller's own windows and silently no-op. What changed here is
+/// how the window gets held. It used to be a synthetic click on the title bar, which meant
+/// finding a point that was both draggable chrome and on screen; that failed on windows whose
+/// title bar is packed with toolbar/tab controls, and outright on windows pushed off the edge
+/// of the display, where there is no such point to click at all.
+///
+/// Now the window is named to the window server by ID (`sm_dragWindowRelativeToMouse`) and the
+/// press it binds to lands on our own invisible panel (`WindowGrabOverlay`), parked under
+/// wherever the cursor already happens to be. Nothing about the target has to be clickable, or
+/// on screen. The cursor is not warped, hidden, or restored — it never moves.
+///
+/// Measured side by side on macOS 27.0 (26A5421a) against a window at x = -600 (title bar off
+/// the left edge): the title-bar press produced no drag at all, so the space switch was refused
+/// and the window stayed put; the server-side drag carried it. See
+/// `~/build/window-shift/window-move-mechanism-analysis-v1.md` for the mechanism's provenance.
+///
+/// Relative bursts are serialised through `RelativeWindowMover`; the wrap-takeover interaction
+/// is guarded by `WindowMover.windowDragInFlight`.
 extension WindowMover {
 
     // MARK: - Shared helpers
-
-    /// Owning process of a window id.
-    static func ownerPID(of wid: UInt32) -> pid_t? {
-        guard let infos = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
-              let pid = infos.first?[kCGWindowOwnerPID as String] as? pid_t else { return nil }
-        return pid
-    }
 
     /// The top-most normal (layer-0) window under a global CG point (top-left origin, matching
     /// `kCGWindowBounds` and `CGEvent.location`), skipping `excludingPID` (our own app, so the
@@ -36,30 +46,9 @@ extension WindowMover {
         return nil
     }
 
-    // MARK: - AX helpers
-
-    /// (wid, element) for each of `pid`'s AX windows, via the private _AXUIElementGetWindow bridge.
-    static func axWindowElements(pid: pid_t) -> [(wid: UInt32, el: AXUIElement)] {
-        let app = AXUIElementCreateApplication(pid)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement] else { return [] }
-        var out: [(UInt32, AXUIElement)] = []
-        for el in windows {
-            var w: UInt32 = 0
-            if sm_windowIDForAXElement(el, &w), w != 0 { out.append((w, el)) }
-        }
-        return out
-    }
-
-    static func axElement(forWid wid: UInt32) -> AXUIElement? {
-        guard let pid = ownerPID(of: wid) else { return nil }
-        return axWindowElements(pid: pid).first { $0.wid == wid }?.el
-    }
-
     /// The managed-space id currently visible on each display, read live from the window server
-    /// (no `SpacesManager.refresh()` side effects). Used off-main to pace the title-bar walk —
-    /// each step waits for its display's current space to reach the next target.
+    /// (no `SpacesManager.refresh()` side effects). Used off-main to pace the walk — each step
+    /// waits for its display's current space to reach the next target.
     static func currentSpaceIDs() -> Set<UInt64> {
         guard let displays = sm_copyManagedDisplaySpaces(sm_mainConnectionID()) as? [[String: Any]]
         else { return [] }
@@ -72,58 +61,40 @@ extension WindowMover {
         return out
     }
 
-    /// A window's AX frame (top-left-origin global coords, like AXPosition).
-    static func axFrame(_ el: AXUIElement) -> CGRect? {
-        var pRef: CFTypeRef?, sRef: CFTypeRef?
-        var p = CGPoint.zero, s = CGSize.zero
-        guard AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &pRef) == .success,
-              AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sRef) == .success,
-              AXValueGetValue(pRef as! AXValue, .cgPoint, &p),
-              AXValueGetValue(sRef as! AXValue, .cgSize, &s) else { return nil }
-        return CGRect(origin: p, size: s)
+    /// The window server's current bounds for one window (global CG, top-left origin).
+    /// The drag offset is measured against this, so it has to be the server's view of the
+    /// window and not Accessibility's.
+    static func serverBounds(of wid: UInt32) -> CGRect? {
+        var r = CGRect.zero
+        if sm_getWindowBounds(wid, &r) { return r }
+        guard let infos = CGWindowListCopyWindowInfo([.optionIncludingWindow], wid) as? [[String: Any]],
+              let b = infos.first?[kCGWindowBounds as String] as? [String: CGFloat] else { return nil }
+        return CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
     }
 
-    // MARK: - Native title-bar drag + Ctrl+fn+Arrow (Hammerspoon technique)
+    // MARK: - Server-side drag + Ctrl+fn+Arrow
 
-    /// The grab point for the title-bar drag: dead center of the gap between the close (red)
-    /// and minimize (yellow) traffic-light buttons — the top-left of the title bar. That gap is
-    /// draggable window chrome on every standard window, whereas the area to the RIGHT of the
-    /// buttons is frequently a unified toolbar / tab bar (Terminal, browsers, Finder) that eats
-    /// the grab — the "won't pick the window up" failures. A synthetic mouse-down landing on a
-    /// button wouldn't move the window either (the button swallows it), so aim for the gap, not
-    /// the buttons. Falls back to just right of the green zoom button, then the frame top-center.
-    static func titleBarPoint(forWid wid: UInt32) -> CGPoint? {
-        guard let el = axElement(forWid: wid) else { return nil }
-        if let close = buttonRect(el, kAXCloseButtonAttribute),
-           let minimize = buttonRect(el, kAXMinimizeButtonAttribute) {
-            return CGPoint(x: (close.midX + minimize.midX) / 2,
-                           y: (close.midY + minimize.midY) / 2)
-        }
-        if let zoom = buttonRect(el, kAXZoomButtonAttribute) {
-            return CGPoint(x: zoom.maxX + 5, y: zoom.midY)
-        }
-        if let f = axFrame(el) { return CGPoint(x: f.midX, y: f.minY + 11) }
-        return nil
-    }
+    /// How long the press waits for the grab overlay to reach the screen. It is normally there
+    /// within a frame; firing before the window server has it would put a stray click into
+    /// whatever app is under the cursor, so the move is abandoned instead.
+    private static let overlayWait: TimeInterval = 0.4
 
-    /// The AX frame of a window's title-bar button (close / minimize / zoom), if it has one.
-    private static func buttonRect(_ window: AXUIElement, _ attribute: String) -> CGRect? {
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, attribute as CFString, &ref) == .success,
-              let b = ref, CFGetTypeID(b) == AXUIElementGetTypeID() else { return nil }
-        return axFrame(b as! AXUIElement)
-    }
-
-    /// Grab the focused window's title bar with a synthetic mouse-down and carry it to `target`.
+    /// Grab a window with a server-side drag and carry it to `target`.
     /// Two modes, both single-grab (the OS carries the held window across each viewport switch):
     ///  - `jumpDesktop` set (a numbered "move to workspace N" shortcut) → drive the native
     ///    "Switch to Desktop N" chord ONCE — the window jumps straight there in one switch.
     ///  - `jumpDesktop` nil (relative next/prev) → tap ⌃+fn+Arrow once per space, paced to each
     ///    switch landing, so the window glides step by step.
-    /// Per-window, fully synthetic (Hammerspoon technique). Wrap is already baked into `target`.
-    static func moveViaTitleBarDrag(wid: UInt32, target: Space, spaces: SpacesManager,
-                                    jumpDesktop: Int? = nil,
-                                    completion: (() -> Void)? = nil) throws {
+    /// Per-window and fully synthetic. Wrap is already baked into `target`.
+    static func moveViaServerDrag(wid: UInt32, target: Space, spaces: SpacesManager,
+                                  jumpDesktop: Int? = nil,
+                                  completion: (() -> Void)? = nil) throws {
+        guard sm_dragWindowAvailable() else { throw MoveError.symbolsUnavailable }
+        // The window server hands a foreign window over to our drag only for a process with
+        // Screen Recording. Without it the call still returns success and the window simply
+        // never follows — so the walk would switch the viewport and leave the window behind.
+        // Preflighting is the only way to tell the difference without a visible test drag.
+        guard CGPreflightScreenCaptureAccess() else { throw MoveError.screenRecordingRequired }
         spaces.refresh()
         let ids = spaceIDs(for: wid)
         guard let cur = spaces.spaces.first(where: {
@@ -138,7 +109,9 @@ extension WindowMover {
         }
         let steps = j - i
         guard steps != 0 else { throw MoveError.sameSpace }
-        guard let titlePt = titleBarPoint(forWid: wid) else { throw MoveError.noFocusedWindow }
+        // The drag holds the grabbed point a fixed distance from the window's origin, so the
+        // offset is read once, up front, against the server's own bounds.
+        guard let frame = serverBounds(of: wid) else { throw MoveError.noFocusedWindow }
         let right = steps > 0, count = abs(steps)
         let dir = right ? 1 : -1
         let stepTargetIDs: [UInt64] = (1...count).map { UInt64(list[i + $0 * dir].managedSpaceID) }
@@ -167,36 +140,31 @@ extension WindowMover {
         for id in enableIDs where !sm_symbolicHotKeyIsEnabled(Int32(id)) {
             _ = sm_symbolicHotKeySetEnabled(Int32(id), true)
         }
-        HotkeyDiag.log("titleBarDrag: wid=\(wid) grab @\(Int(titlePt.x)),\(Int(titlePt.y)) "
-            + (jump != nil ? "jump -> desktop \(jumpDesktop!)" : "walk \(steps)") + " -> space \(target.managedSpaceID)")
+
+        // The press goes wherever the pointer already is; the overlay catches it. Park the
+        // overlay there now so the window server has it on screen by the time the press fires.
+        let cursor = CGEvent(source: nil)?.location ?? CGPoint(x: frame.midX, y: frame.midY)
+        let overlay = WindowGrabOverlay.shared
+        overlay.show(atCG: cursor)
+
+        HotkeyDiag.log("windowDrag: wid=\(wid) press @\(Int(cursor.x)),\(Int(cursor.y)) "
+            + (jump != nil ? "jump -> desktop \(jumpDesktop!)" : "walk \(steps)")
+            + " -> space \(target.managedSpaceID)")
 
         // Stand our own wrap-takeover tap down for the move — otherwise it swallows our synthetic
-        // ⌃+fn+arrows (see WindowMover.titleBarDragInFlight). Set on main, before any post.
-        titleBarDragInFlight = true
-        // Single grab / single drop throughout: re-grabbing per step read as a title-bar double-click
-        // and maximised the window. Off the main thread (CG posts are thread-safe; no UI stall).
+        // ⌃+fn+arrows (see WindowMover.windowDragInFlight). Set on main, before any post.
+        windowDragInFlight = true
+        // Single grab / single drop throughout. Off the main thread (CG posts are thread-safe;
+        // no UI stall) — which is also why the overlay wait below may block.
         DispatchQueue.global(qos: .userInteractive).async {
             let src = CGEventSource(stateID: .hidSystemState)
             src?.localEventsSuppressionInterval = 0
-            let origMouse = CGEvent(source: nil)?.location ?? .zero
-            // Grab the title bar INVISIBLY (window-shift's disguise). Posting real mouse events at
-            // the title bar unavoidably moves the on-screen cursor there, so for the brief move we
-            // HIDE the cursor (sm_setsCursorInBackground lets a background/accessory app's hide take
-            // effect) and disassociate it from the mouse so trackpad motion can't fight the grab.
-            // Position, visibility, and coupling are all restored at the end — to the user the
-            // pointer never leaves where they left it while the window is grabbed and carried unseen.
-            CGAssociateMouseAndMouseCursorPosition(0)
-            sm_setsCursorInBackground()
-            CGDisplayHideCursor(CGMainDisplayID())
             func mouse(_ t: CGEventType, _ p: CGPoint) {
-                CGWarpMouseCursorPosition(p)
                 let e = CGEvent(mouseEventSource: src, mouseType: t, mouseCursorPosition: p, mouseButton: .left)
                 // Clear any physically-held modifiers. The .hidSystemState source folds the LIVE
                 // hardware modifier state into the event, and a held ⌃ (part of a ⌘⌥⌃⇧ move chord)
-                // makes leftMouseDown a control-click — a right-click, which never grabs the window.
-                // That's the physical-⌘⌥⌃⇧-vs-Caps-hyper asymmetry: the hyper tap adds modifiers to
-                // KEY events only, so its grab stays clean. The keyboard steps below set their own
-                // explicit flags, so only the mouse events need clearing.
+                // makes leftMouseDown a control-click — a right-click, which starts no drag. The
+                // keyboard steps below set their own explicit flags, so only the mouse needs this.
                 e?.flags = []
                 e?.post(tap: .cgSessionEventTap)
             }
@@ -217,8 +185,41 @@ extension WindowMover {
                 for _ in 0..<tries { if currentSpaceIDs().contains(id) { return true }; usleep(30_000) }
                 return false
             }
-            mouse(.mouseMoved, titlePt); usleep(30_000)
-            mouse(.leftMouseDown, titlePt); usleep(110_000)              // ONE grab of the title bar
+            func finish(_ settled: Bool, _ note: String?) {
+                overlay.hide()
+                for (idx, id) in enableIDs.enumerated() where !wasEnabled[idx] {
+                    _ = sm_symbolicHotKeySetEnabled(Int32(id), false)   // restore native-shortcut state
+                }
+                DispatchQueue.main.async {
+                    windowDragInFlight = false   // re-arm the wrap-takeover tap
+                    spaces.refresh()
+                    HotkeyDiag.log("windowDrag: released wid=\(wid) settled=\(settled)"
+                        + (note.map { " (\($0))" } ?? ""))
+                    completion?()
+                }
+            }
+
+            // The press must land on the overlay, never in the user's app: if the window server
+            // hasn't got the panel on screen yet, abandon rather than fire blind.
+            guard overlay.waitUntilReady(timeout: overlayWait) else {
+                finish(false, "grab overlay never reached the screen")
+                return
+            }
+            // The user's hand must not steer the drag while the window is held: with the mouse
+            // decoupled from the cursor, physical motion generates no movement for the server-side
+            // drag to follow, so the window stays exactly where it is while it is carried across.
+            CGAssociateMouseAndMouseCursorPosition(0)
+            mouse(.mouseMoved, cursor); usleep(30_000)
+            mouse(.leftMouseDown, cursor); usleep(110_000)              // ONE press, on the overlay
+            let err = sm_dragWindowRelativeToMouse(
+                wid, CGPoint(x: cursor.x - frame.minX, y: cursor.y - frame.minY))
+            if err != 0 {
+                mouse(.leftMouseUp, cursor)
+                CGAssociateMouseAndMouseCursorPosition(1)
+                finish(false, "window server refused the drag (error \(err))")
+                return
+            }
+
             if let jump = jump {
                 let mv = modVK(jump.flags)
                 key(mv, true, flags: jump.flags, flagsChanged: true); usleep(30_000)   // modifier DOWN
@@ -229,9 +230,8 @@ extension WindowMover {
                 usleep(120_000)
             } else {
                 // Drive the user's ACTUAL "Move left/right a space" shortcut (79/81) once per space.
-                // It's remappable in System Settings (this user runs a ⌘⌥⌃+arrow Global Modifier), so a
-                // hardcoded ⌃+arrow matches nothing and the window silently fails to walk — Caps-hyper
-                // only masked this by re-adding ⌘⌥⌃ to our synthetic keys; a physical press has no helper.
+                // It's remappable in System Settings, so a hardcoded ⌃+arrow can match nothing and the
+                // window silently fails to walk.
                 let moveID = right ? SystemShortcuts.moveRightID : SystemShortcuts.moveLeftID
                 let sc = SystemShortcuts.systemBinding(id: moveID)
                 let arrow: CGKeyCode = sc?.keyCode ?? (right ? 0x7C : 0x7B)
@@ -248,24 +248,14 @@ extension WindowMover {
                 usleep(120_000)                                         // hold the grab while the last lands
                 key(modVKey, false, flags: [], flagsChanged: true); usleep(30_000)   // modifiers UP
             }
-            mouse(.leftMouseUp, titlePt)                               // ONE drop, onto the target space
+            mouse(.leftMouseUp, cursor)                                // ONE drop, onto the target space
             var settled = false
             for _ in 0..<12 {                                          // confirm the window reached target
                 if spaceIDs(for: wid).contains(finalID) { settled = true; break }
                 usleep(50_000)
             }
-            CGWarpMouseCursorPosition(origMouse)                       // put the cursor back where it was
-            CGDisplayShowCursor(CGMainDisplayID())                     // reveal it there — never at the title bar
             CGAssociateMouseAndMouseCursorPosition(1)                  // re-couple mouse ↔ cursor
-            for (idx, id) in enableIDs.enumerated() where !wasEnabled[idx] {
-                _ = sm_symbolicHotKeySetEnabled(Int32(id), false)      // restore native-shortcut state
-            }
-            DispatchQueue.main.async {
-                titleBarDragInFlight = false   // re-arm the wrap-takeover tap
-                spaces.refresh()
-                HotkeyDiag.log("titleBarDrag: released wid=\(wid) settled=\(settled)")
-                completion?()
-            }
+            finish(settled, nil)
         }
     }
 }

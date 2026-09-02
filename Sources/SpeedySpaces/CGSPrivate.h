@@ -9,6 +9,8 @@
 #define CGSPRIVATE_H
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CGGeometry.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef int CGSConnectionID;
@@ -24,9 +26,15 @@ CGSConnectionID sm_mainConnectionID(void);
 /// manages the release), or NULL if the symbol can't be resolved on this OS.
 CFArrayRef sm_copyManagedDisplaySpaces(CGSConnectionID cid) CF_RETURNS_RETAINED;
 
-/// Allow CGDisplayHideCursor to hide the pointer from a background (accessory) app — needed so
-/// the invisible window-move grab can hide the cursor while it drives the synthetic drag.
-void sm_setsCursorInBackground(void);
+/// Bind the mouse button that is CURRENTLY DOWN to a server-side drag of `wid`, with the
+/// grabbed point held `offset` (cursor - window origin, global CG top-left coords) from the
+/// window's origin for the drag's duration. Returns the raw CGError, or -1 if the symbol is
+/// unresolvable on this OS. This is how a window is "held" for the move-to-workspace walk:
+/// macOS carries a dragged window across each space switch, and naming the window by ID means
+/// nothing has to be clickable — the title bar may be full of toolbar controls or entirely
+/// off-screen. A live button-down is mandatory; with none, the call succeeds and does nothing.
+int32_t sm_dragWindowRelativeToMouse(uint32_t wid, CGPoint offset);
+bool sm_dragWindowAvailable(void);
 
 #include <stdbool.h>
 
