@@ -52,6 +52,11 @@ final class MissionControlOverlay: NSObject {
     private let burstInterval: TimeInterval = 1.0 / 30 // probe burst after a self-initiated MC open
     private let settleAfterFrames = 45                 // still frames before pausing the link
     private var burstUntil: CFTimeInterval = 0
+    /// Tracking backstop cadence, and the link-silence a backstop tick has to see before it
+    /// drives a frame itself. The gap is deliberately just over one 120 Hz interval, so on a
+    /// healthy link every backstop tick returns immediately and costs nothing.
+    private let backstopInterval: TimeInterval = 1.0 / 60
+    private let linkStallGap: TimeInterval = 1.0 / 90
 
     // MARK: - Discovery / sampling state
 
@@ -80,6 +85,9 @@ final class MissionControlOverlay: NSObject {
     private var wasSuppressed = false
     private var wasTilesStill = false
     private var mappedOnce = false
+    /// Whether any caption spring was still in flight at the end of the last frame (see
+    /// frame()'s `mustSample`).
+    private var springsFlying = false
     /// Tile window -> space uuid, committed while tiles are at rest and ridden while they
     /// move, so labels stay with their spaces through reorder drags (see mapLabels).
     private var tileSpace: [CGWindowID: String] = [:]
@@ -380,7 +388,7 @@ final class MissionControlOverlay: NSObject {
         case .settled:
             sampleNow = true            // this watch exists to spot the bar going away
             frame(now: CACurrentMediaTime(), dt: 0, stepSprings: false)
-        case .tracking: break
+        case .tracking: driveFrame(minInterval: linkStallGap)
         }
     }
 
@@ -388,16 +396,21 @@ final class MissionControlOverlay: NSObject {
         phase = .tracking
         stableFrames = 0
         sampleNow = true
-        timer?.invalidate(); timer = nil
         if let link {
             link.isPaused = false
         } else if let screen = NSScreen.screens.max(by: { $0.maximumFramesPerSecond < $1.maximumFramesPerSecond }) {
             let l = screen.displayLink(target: self, selector: #selector(frameTick(_:)))
             l.add(to: .main, forMode: .common)
             link = l
-        } else {
-            scheduleTimer(burstInterval, tolerance: 0.005)   // headless fallback: 30 Hz timer
         }
+        // Backstop for the display link, which STOPS being called while WindowManager
+        // composites a Mission Control relayout — measured 567 ms without a single
+        // callback across an add-desktop animation, so the captions sat still through the
+        // whole glide and then landed in one step. The run loop itself keeps turning, so
+        // an ordinary timer carries the springs through the gap. It only fires frames the
+        // link failed to deliver (see `linkStallGap`), and is the sole driver on a
+        // headless/no-screen build, where `link` stays nil.
+        scheduleTimer(backstopInterval, tolerance: 0.002)
         lastFrame = CACurrentMediaTime()
     }
 
@@ -429,6 +442,7 @@ final class MissionControlOverlay: NSObject {
         pendingBirths = []
         lastSampleResult = ([], [], false, 0)
         wasSuppressed = false; wasTilesStill = false; mappedContentGen = -1
+        springsFlying = false
         clickGates.set((barMaxY: 300, tileRects: []))
         labelAreas.withLock { $0.areas = [] }
         lastMismatchSig = ""
@@ -1293,9 +1307,24 @@ final class MissionControlOverlay: NSObject {
 
     // MARK: - Per-frame drive
 
-    @objc private func frameTick(_ link: CADisplayLink) {
+    @objc private func frameTick(_ link: CADisplayLink) { driveFrame() }
+
+    /// One animation frame, from whichever driver reached it first — the display link, or
+    /// the tracking backstop timer when the link has stalled for `minInterval`.
+    private func driveFrame(minInterval: CFTimeInterval = 0) {
         let now = CACurrentMediaTime()
-        let dt = min(max(now - lastFrame, 0), 1.0 / 30)   // clamp: no teleport after a stall
+        guard now - lastFrame >= minInterval else { return }
+        // REAL elapsed time, not a per-frame budget. The springs replay the native curve
+        // against the same wall clock the tiles animate on, and springStep is the exact
+        // closed-form solution of a critically damped spring — so a big dt lands exactly
+        // where the curve is now, and can never overshoot. Clamping it (this was 1/30)
+        // instead made a stalled frame advance the label by only 33 ms of curve, and the
+        // sampler DOES stall: sm_getWindowBounds blocks while WindowManager composites,
+        // measured up to 233 ms on an add/remove relayout. Every stall then leaked
+        // simulated time and the captions ran in slow motion, trailing the tiles by up to
+        // two seconds on an add or remove. The cap is only a sanity bound — anything past
+        // it (app suspended, display sleep) should snap to the settled layout anyway.
+        let dt = min(max(now - lastFrame, 0), 0.5)
         lastFrame = now
         frame(now: now, dt: dt, stepSprings: true)
     }
@@ -1315,8 +1344,20 @@ final class MissionControlOverlay: NSObject {
         // progress (measured: emits no reliable commits) or a bar still materialising its
         // tiles. Otherwise a slow safety cadence is enough and the frames in between are
         // pure spring stepping.
+        // ...and while the captions are mid-flight replaying a commit there is nothing to
+        // poll FOR: the sampled tiles already sit at their final rects, and the only thing
+        // that can move them again is another commit, which pushes `sampleNow` through
+        // kickFrame. Polling anyway blocks the main thread for as long as WindowManager
+        // needs to composite the relayout — measured 130 ms, and 567 ms in one add — which
+        // is the entire glide, so the springs got no frames at all and the captions
+        // teleported into place at the end instead of riding the tiles.
+        // `needsRediscovery` deliberately does NOT force a sample: discovery runs off-main
+        // and republishes `sampleNow` itself if the scan actually changed the wid set, so
+        // keeping it here only meant a permanent tile/space disagreement (exactly what an
+        // add or remove creates) pinned the blocking sampler at frame rate.
+        let gliding = springsFlying && wasTilesStill
         let mustSample = sampleNow || !haveSample || mouseHeld.get() || awaitingTiles
-            || needsRediscovery || now - lastSample >= samplePollInterval
+            || (!gliding && now - lastSample >= samplePollInterval)
         sampleNow = false
         if mustSample {
             lastSample = now
@@ -1443,6 +1484,7 @@ final class MissionControlOverlay: NSObject {
             unchangedDiscoveries = 0
             needsRediscovery = true
         }
+        springsFlying = anyMoving
         if phase == .tracking {
             // Never settle while the left button is down: a tile reorder or window drag
             // moves the bar's geometry continuously without reliable commit events (the
