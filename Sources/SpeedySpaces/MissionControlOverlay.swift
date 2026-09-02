@@ -144,15 +144,21 @@ final class MissionControlOverlay: NSObject {
     /// born in the session, not just Mission Control's).
     private var lastEventProbe: CFTimeInterval = 0
 
-    /// Geometry sampler. Default: the public description path — besides bounds it carries
-    /// kCGWindowIsOnscreen, which is the ONLY early Mission-Control-dismissal signal
-    /// (measured: tiles go !onscreen ~30 ms into the exit and the bar follows, while
-    /// SLSGetWindowBounds keeps answering with stale bounds until well after the exit
-    /// animation finishes). MCO_SLS=1 opts into the allocation-free private sampler for
-    /// benchmarking; it costs late dismissal detection (the exit fade
-    /// launches after the fact instead of at the trigger).
+    /// Geometry sampler. Default: `SLSGetWindowBounds` — one direct window-server query
+    /// per window, allocation-free, reporting the rect WindowManager actually committed.
+    ///
+    /// The public description path used to be the default because it also carries
+    /// kCGWindowIsOnscreen, which was the earliest dismissal signal available (tiles went
+    /// !onscreen ~30 ms into the exit, ahead of the bar). That measurement INVERTED on
+    /// 26A5425a: the flag now outlives the close by ~470 ms, while the Dock's "mc" AX
+    /// element dies at +0 ms and drives the exit instead (fix-workspace-lag.md). With its
+    /// one advantage gone, the cheaper path wins on merit: benchmarked over 19 live
+    /// bar+tile windows it costs 280 µs against the description path's 508 µs (1.8x, i.e.
+    /// ~230 µs off every frame). Note that is the SAMPLER only — the frame's dominant cost
+    /// is the periodic discover() window-list scan, which this does not touch.
+    /// MCO_CGDESC=1 forces the description path back.
     private let useSLS = sm_getWindowBoundsAvailable()
-        && ProcessInfo.processInfo.environment["MCO_SLS"] != nil
+        && ProcessInfo.processInfo.environment["MCO_CGDESC"] == nil
 
     // MARK: - Screen / spaces caches (invalidated on screen or space-list change)
 
@@ -781,10 +787,11 @@ final class MissionControlOverlay: NSObject {
     /// completes within ~70 ms of the trigger); sampling stays live and either confirms
     /// the close (which finds nothing left to animate) or, if MC didn't actually
     /// dismiss, rebuilds the labels after the suppression window and fades them back in.
-    private func dismissalInitiated(_ how: String) {
-        guard phase != .closed else { return }
+    @discardableResult
+    private func dismissalInitiated(_ how: String) -> Bool {
+        guard phase != .closed else { return false }
         let now = CACurrentMediaTime()
-        guard now - dismissalAt > 1.0 else { return }
+        guard now - dismissalAt > 1.0 else { return false }
         dismissalAt = now
         dbg("dismissal initiated (\(how)) — labels fade out")
         for w in overlays.values { w.exitDismiss() }
@@ -798,6 +805,7 @@ final class MissionControlOverlay: NSObject {
             self.dbg("dismissal close-confirm timeout — forcing closed")
             self.close(dismissing: true)   // labels already faded; nothing left to animate
         }
+        return true
     }
 
     // MARK: - Dock AX teardown watch (catches dismissals no event tap can see)
@@ -871,19 +879,59 @@ final class MissionControlOverlay: NSObject {
 
     private func axTeardownFired() {
         guard phase != .closed else { return }
-        // The Dock recreates its "mc" AX element when the bar re-renders for an in-place
-        // space switch, destroying the element we were observing WITHOUT Mission Control
-        // closing. The tiles STAY put through that re-render but vanish first on a genuine
-        // dismissal (~30 ms before the bar), so they're the discriminator: tiles still on
-        // screen ⇒ re-render ⇒ re-attach and leave the labels standing; tiles gone ⇒ real
-        // teardown ⇒ fade out now (no waiting for the bar, which lingers).
+        // The element's destruction is the EARLIEST dismissal signal on this OS: measured
+        // at +0 ms after the close trigger on 26A5425a, against ~470 ms for the tiles'
+        // kCGWindowIsOnscreen flag and ~480 ms for the first SLS event
+        // (fix-workspace-lag.md). It used to be gated behind a tiles-still-on-screen
+        // check, on the premise that tiles vanish ~30 ms into a real dismissal and stay
+        // put through the Dock's in-place re-render. That premise INVERTED: the onscreen
+        // flag now outlives the close by half a second, so the check matched at every
+        // close and misfiled all of them as re-renders — which is precisely why the
+        // labels hung over the restored desktop.
+        //
+        // So act now and verify after. A re-render leaves a live "mc" element behind; a
+        // real close does not, immediately. If one turns up, the dismissal is cancelled
+        // and the labels re-reveal before the fade has finished.
         stopAXWatch()
-        if NativeBarWindows.tilesOnScreen() {
-            dbg("AX element destroyed but tiles still on screen — re-arming (in-place switch)")
-            startAXWatch()
-            return
+        if dismissalInitiated("mc AX teardown") { verifyTeardown(dismissalAt) }
+    }
+
+    /// Fresh existence scan for the Dock's "mc" element — the whole child list, not the
+    /// element we were observing (that one is destroyed either way). Runs OFF-MAIN: the
+    /// tree query can block on a Dock that is mid-teardown.
+    private func mcAXElementPresent() -> Bool {
+        guard let dock = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.dock").first else { return false }
+        let app = AXUIElementCreateApplication(dock.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.05)
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXChildrenAttribute as CFString, &v) == .success,
+              let kids = v as? [AXUIElement] else { return false }
+        return kids.contains { el in
+            var idv: CFTypeRef?
+            return AXUIElementCopyAttributeValue(el, "AXIdentifier" as CFString, &idv) == .success
+                && (idv as? String) == "mc"
         }
-        dismissalInitiated("mc AX teardown")
+    }
+
+    /// Second half of the teardown decision: the labels are already fading, so this only
+    /// has to catch the false positive. A live "mc" element this soon after the teardown
+    /// means Mission Control never closed (an in-place re-render) — cancel the pending
+    /// force-close, drop the update suppression so the labels rebuild, and re-arm.
+    private func verifyTeardown(_ firedAt: CFTimeInterval) {
+        axQueue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self else { return }
+            let present = self.mcAXElementPresent()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, present, self.phase != .closed,
+                      self.dismissalAt == firedAt else { return }
+                self.dbg("mc AX element back \(Int((CACurrentMediaTime() - firedAt) * 1000)) ms after teardown"
+                    + " — in-place re-render, re-revealing")
+                self.dismissalAt = 0
+                self.startAXWatch()
+                self.kickFrame()
+            }
+        }
     }
 
     private func stopAXWatch() {
@@ -1095,9 +1143,10 @@ final class MissionControlOverlay: NSObject {
             if now - lastDiscovery >= effectiveRediscoveryInterval { discover(now: now); statDiscovers += 1 }
         }
         var s = sample()
-        // Dismissal shows up as windows dying, leaving the on-screen list, or — earliest of
-        // all — every tile going !onscreen at once (~30 ms before the bar follows). Confirm
-        // any of those with a fresh discovery scan before concluding anything.
+        // Dismissal shows up as windows dying or leaving the on-screen list. Both now lag
+        // the visible exit by ~0.5 s (the onscreen flag no longer leads it — see `useSLS`),
+        // so this is the BACKSTOP; the AX teardown at +0 ms is the real exit trigger.
+        // Confirm any of these with a fresh discovery scan before concluding anything.
         if s.missing || s.bars.isEmpty || (s.tiles.isEmpty && !lastTileRects.isEmpty) {
             discover(now: now)
             statDiscovers += 1
@@ -1147,7 +1196,7 @@ final class MissionControlOverlay: NSObject {
         let suppressed = now - dismissalAt < 1.0
         if !suppressed {
             var active = Set<CGDirectDisplayID>()
-            for (screen, labels) in byScreen {
+            for (screen, labels, complete) in byScreen {
                 guard let did = screen.displayID else { continue }
                 active.insert(did)
                 let w = overlay(for: screen, did: did)
@@ -1162,7 +1211,7 @@ final class MissionControlOverlay: NSObject {
                     BarLabel(id: $0.id, center: NSPoint(x: $0.center.x - o.x, y: $0.center.y - o.y),
                              name: $0.name, icon: $0.icon, contentKey: $0.contentKey,
                              placeholderWidth: $0.placeholderWidth)
-                }, now: now, replay: replay)
+                }, now: now, replay: replay, nativeReveal: complete && eventsArmed)
                 if stepSprings {
                     if w.step(dt: dt) { anyMoving = true }
                 } else if w.needsMotion {
@@ -1226,10 +1275,11 @@ final class MissionControlOverlay: NSObject {
     // MARK: - Tile → space mapping
 
     private func mapLabels(bars: [NSRect], tiles: [(wid: CGWindowID, rect: NSRect)],
-                           now: CFTimeInterval, tilesAtRest: Bool) -> [(NSScreen, [BarLabel])] {
+                           now: CFTimeInterval, tilesAtRest: Bool)
+        -> [(screen: NSScreen, labels: [BarLabel], complete: Bool)] {
         rebuildScreenCacheIfNeeded()
         rebuildSpacesCacheIfNeeded()
-        var out: [(NSScreen, [BarLabel])] = []
+        var out: [(screen: NSScreen, labels: [BarLabel], complete: Bool)] = []
         var mismatchSig = ""
         var mismatchWithTiles = false
         var zeroTileBar = false
@@ -1250,7 +1300,7 @@ final class MissionControlOverlay: NSObject {
             let sf = screen.frame
             guard bars.contains(where: { sf.contains(CGPoint(x: $0.midX, y: $0.midY)) }) else { continue }
             let scr = spacesByDisplay[did] ?? []
-            guard !scr.isEmpty else { out.append((screen, [])); continue }
+            guard !scr.isEmpty else { out.append((screen, [], false)); continue }
             let t = tiles.filter { sf.contains(CGPoint(x: $0.rect.midX, y: $0.rect.midY)) }
                 .sorted { $0.rect.minX < $1.rect.minX }
             if t.count != scr.count {
@@ -1317,7 +1367,10 @@ final class MissionControlOverlay: NSObject {
                         name: nil, icon: over.icon, contentKey: over.key))
                 }
             }
-            out.append((screen, labels))
+            // Every tile this display's space list expects is on screen at its committed
+            // rect: the geometry is final, so the labels can reveal on the native curve
+            // instead of waiting out the stillness gate (see OverlayWindow.update).
+            out.append((screen, labels, t.count == scr.count))
         }
         // Tile count disagreeing with the space list either means the bar is collapsed
         // (0 tiles — keep re-scanning so the expand is caught fast, but the space list is
@@ -1559,6 +1612,8 @@ private final class OverlayWindow: NSPanel {
     private let revealStableFor: CFTimeInterval = 0.05
     private let revealMaxWait: CFTimeInterval = 0.50
     private let stabilityEps: CGFloat = 1.0
+    /// Duration of the native expand fade the in-place reveal replays (measured ~120 ms).
+    private let nativeExpandFade: CFTimeInterval = 0.12
 
     /// Launch entrance: the initial batch of captions originates halfway between its resting
     /// spot and the top of the screen, then descends into place while its opacity ramps 0→100%
@@ -1602,7 +1657,8 @@ private final class OverlayWindow: NSPanel {
     /// diff against the shown labels by space uuid and retarget the springs. `replay`
     /// marks targets that came from an 806/807 relayout commit — those launch the
     /// native-matched replay spring rather than the fallback pursuit/layout ones.
-    func update(labels: [BarLabel]?, now: CFTimeInterval, replay: Bool = false) {
+    func update(labels: [BarLabel]?, now: CFTimeInterval, replay: Bool = false,
+                nativeReveal: Bool = false) {
         guard let labels, !labels.isEmpty else {
             guard expandedSince != nil || !items.isEmpty else { emptySince = nil; return }
             // Grace period: every tile vanishing at once is how MC dismissal BEGINS (the
@@ -1657,12 +1713,47 @@ private final class OverlayWindow: NSPanel {
         // motion — a mid-flight add/remove just retargets whatever spring is playing.
 
         if maxDrift >= stabilityEps || changedSet { unstableAt = now }
-        if !revealed, let since = expandedSince,
-           now - unstableAt >= revealStableFor || now - since >= revealMaxWait {
-            revealed = true
-            OverlayWindow.onReveal?(items.count, Int((now - since) * 1000))
-            beginEntrance()
-            fadeIn()
+        if !revealed, let since = expandedSince {
+            // `nativeReveal` says every tile this display expects is on screen at its
+            // committed rect, so there is nothing left to wait for. The stillness gate
+            // below is the fallback for the sampling path: it re-arms on every label the
+            // incremental discovery adds, which is what pushed the reveal out to its
+            // 500 ms cap (measured: "reveal: 22 labels after 502 ms") and made the labels
+            // pop in long after the tiles had finished fading.
+            if nativeReveal {
+                revealed = true
+                OverlayWindow.onReveal?(items.count, Int((now - since) * 1000))
+                revealInPlace()
+            } else if now - unstableAt >= revealStableFor || now - since >= revealMaxWait {
+                revealed = true
+                OverlayWindow.onReveal?(items.count, Int((now - since) * 1000))
+                beginEntrance()
+                fadeIn()
+            }
+        }
+    }
+
+    /// Native expand on macOS 27 (26A5425a): the tiles are BORN at their final rects and
+    /// fade in place over ~120 ms — the flight up from the collapsed pill slots is gone
+    /// from the OS animation (measured off a 240 fps capture, fix-workspace-lag.md). Match
+    /// it exactly: plant every caption on its final target and ramp the whole container's
+    /// alpha on the same curve, so the labels materialize WITH their tiles rather than
+    /// arriving after them.
+    private func revealInPlace() {
+        for it in items.values {
+            it.pos = it.target
+            it.vel = .zero
+            it.settled = true
+            it.entering = false
+            it.field.alphaValue = 1
+            place(it, aligned: true)
+        }
+        container.alphaValue = 0
+        fadeGen += 1
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = nativeExpandFade
+            ctx.timingFunction = Self.fadeInCurve
+            container.animator().alphaValue = 1
         }
     }
 

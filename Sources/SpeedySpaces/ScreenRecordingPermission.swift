@@ -41,7 +41,12 @@ enum ScreenRecordingPermission {
         alert.addButton(withTitle: "Not Now")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        // Registers the app in the Screen Recording list (and shows the system prompt once).
+        openSettings()
+    }
+
+    /// Register the app in the Screen Recording list — which is what makes it APPEAR there
+    /// at all, so it must happen before the pane opens — and then show the pane.
+    static func openSettings() {
         CGRequestScreenCaptureAccess()
         if let url = URL(string:
             "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {

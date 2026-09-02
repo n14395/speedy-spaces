@@ -36,6 +36,13 @@ final class SettingsController: NSWindowController {
     /// reprogrammable chords when it's off.
     private var moveRecorders: [(action: HotkeyAction, recorder: ShortcutRecorderView)] = []
     private var nativeShortcutsObserver: NSObjectProtocol?
+    /// The Screen Recording banner on the Moving Windows sub-tab: moving a window between
+    /// workspaces is the ONE feature that needs the grant, so its state is shown where the
+    /// move shortcuts are. Re-read whenever the pane refreshes or the window becomes key —
+    /// the user may have granted it in System Settings while this window stayed open.
+    private weak var screenRecordingStatus: NSTextField?
+    private weak var screenRecordingButton: NSButton?
+    private var screenRecordingActiveObserver: NSObjectProtocol?
     private weak var spacingValueLabel: NSTextField?
     private weak var edgeValueLabel: NSTextField?
     private weak var switcherFlashDurationReadout: NSTextField?
@@ -591,6 +598,9 @@ final class SettingsController: NSWindowController {
         if let outcomeObserver { NotificationCenter.default.removeObserver(outcomeObserver) }
         if let hotkeysReloadObserver { NotificationCenter.default.removeObserver(hotkeysReloadObserver) }
         if let nativeShortcutsObserver { NotificationCenter.default.removeObserver(nativeShortcutsObserver) }
+        if let screenRecordingActiveObserver {
+            NotificationCenter.default.removeObserver(screenRecordingActiveObserver)
+        }
     }
 
     @objc private func toggleLogin(_ sender: NSButton) {
@@ -652,6 +662,23 @@ final class SettingsController: NSWindowController {
     @objc private func toggleSwitcherHold(_ sender: NSButton) {
         Prefs.switcherHoldEnabled = sender.state == .on
         updateHoldStatus()
+        refreshScreenRecordingBanner()
+    }
+
+    /// Re-read the Screen Recording grant and restate it. Granting takes effect for the
+    /// window server on the next launch, so a freshly-granted app says so rather than
+    /// claiming a capability this process does not yet have.
+    fileprivate func refreshScreenRecordingBanner() {
+        let granted = ScreenRecordingPermission.isGranted
+        screenRecordingStatus?.stringValue = granted
+            ? "✔︎ Screen Recording is allowed — moving windows between workspaces works."
+            : "⚠︎ Screen Recording is not allowed — moving windows between workspaces won’t work."
+        screenRecordingStatus?.textColor = granted ? .secondaryLabelColor : .systemOrange
+        screenRecordingButton?.isHidden = granted
+    }
+
+    @objc fileprivate func openScreenRecordingSettings(_ sender: NSButton) {
+        ScreenRecordingPermission.openSettings()
     }
 
     /// The three switcher types collapse the (style, position) prefs into one choice:
@@ -1272,6 +1299,50 @@ extension SettingsController {
         extraRow.orientation = .horizontal
         extraRow.spacing = 8
 
+        // --- Screen Recording (governs whether the Move rows can work at all) ----
+        // Moving a window to another workspace asks the window server to CARRY the window
+        // through the workspace switch, and it only hands a window over to an app holding
+        // Screen Recording. It refuses silently — the call reports success and the window
+        // simply stays behind — so the state has to be surfaced rather than discovered.
+        let permissionHeader = NSTextField(labelWithString: "Permission")
+        permissionHeader.font = .boldSystemFont(ofSize: 13)
+
+        let permissionStatus = NSTextField(labelWithString: "")
+        permissionStatus.font = .systemFont(ofSize: 12)
+        self.screenRecordingStatus = permissionStatus
+
+        let permissionNote = NSTextField(wrappingLabelWithString:
+            "Moving a window to another workspace asks macOS to carry the window along with the "
+            + "workspace switch, which it only allows for an app with Screen Recording access. "
+            + "SpeedySpaces never records or captures your screen — switching workspaces, the "
+            + "switcher, and every other shortcut work without this. Without it, the move "
+            + "shortcuts below do nothing.")
+        permissionNote.textColor = .secondaryLabelColor
+        permissionNote.font = .systemFont(ofSize: 11)
+        permissionNote.preferredMaxLayoutWidth = 470
+
+        let permissionButton = NSButton(title: "Open Screen Recording Settings",
+                                        target: self, action: #selector(openScreenRecordingSettings(_:)))
+        self.screenRecordingButton = permissionButton
+
+        let permissionBox = NSStackView(views: [permissionHeader, permissionStatus,
+                                                permissionNote, permissionButton])
+        permissionBox.orientation = .vertical
+        permissionBox.alignment = .leading
+        permissionBox.spacing = 4
+
+        let permissionDivider = NSBox()
+        permissionDivider.boxType = .separator
+        permissionDivider.translatesAutoresizingMaskIntoConstraints = false
+        permissionDivider.widthAnchor.constraint(equalToConstant: 470).isActive = true
+
+        // The grant is picked up on relaunch, but the STATUS should not go stale while the
+        // user is toggling it in System Settings with this window open.
+        screenRecordingActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) {
+                [weak self] _ in self?.refreshScreenRecordingBanner()
+        }
+
         let note = NSTextField(wrappingLabelWithString:
             "App and Displays shortcuts are optional — click a field and type a chord (⎋ cancels, "
             + "⌫ clears). Shortcuts for a specific space are set in that space's editor (pencil "
@@ -1297,7 +1368,7 @@ extension SettingsController {
                switchingRow(SystemShortcuts.moveLeftID, "Previous Space"),
                shortcutRow(.backAndForth)]))
         subTabs.addTabViewItem(subTab("Moving Windows",
-            [extraRow]
+            [permissionBox, permissionDivider, extraRow]
             + (1...12).map { moveRow(HotkeyAction(rawValue: "moveFollowToSpace\($0)")!) }
             + [moveRow(.moveFollowNext), moveRow(.moveFollowPrev)]))
         subTabs.addTabViewItem(subTab("Displays", [
