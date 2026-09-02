@@ -2,9 +2,9 @@
 
 A macOS menu bar app that gives your Spaces names, icons, and shortcuts.
 
-macOS calls them "Desktop 1" through "Desktop 9" and gives you no way to tell them
-apart. SpeedySpaces names them, puts those names in the menu bar and in Mission Control
-itself, and lets you jump between them with a hotkey, a gesture, or a click.
+macOS calls them "Desktop 1" through "Desktop 9" and gives you no way to tell them apart.
+SpeedySpaces names them, puts those names in the menu bar and in Mission Control itself,
+and lets you jump between them with a hotkey, a gesture, or a click.
 
 ![Custom names and icons on Mission Control's own thumbnails](docs/mission-control-labels.png)
 
@@ -18,30 +18,33 @@ thumbnails, above the untouched "Desktop N" caption. Click a label to rename tha
 on the spot. Labels track Mission Control's own add, remove, and reorder animations.
 
 **Menu bar.** Show the current Space's icon, name, and/or number — or a full strip with
-one clickable segment per Space. Multi-display aware: follow the focused display,
-collapse the others, or hide single-Space displays.
+one clickable segment per Space. Multi-display aware: follow the focused display, collapse
+the others, or hide single-Space displays.
+
+![Menu bar strip with per-space icons and the current space](docs/menu-bar.png)
 
 **Switcher.** A wallpaper-thumbnail HUD that appears when you change Spaces or while you
 hold a key, in either a full-width Mission Control style or a compact popover. Click a
 tile to switch, drag tiles to reorder Spaces — including across displays. Add and remove
 desktops without opening Mission Control.
 
-**Shortcuts.** Per-Space global hotkeys, a modifier-plus-number scheme, wrap-around
+![The workspace switcher popup](docs/switcher.png)
+
+**Hotkeys.** Per-Space global hotkeys, a modifier-plus-number scheme, wrap-around
 stepping, and a Caps Lock hyper key. Send the focused window to another Space and follow
 it there.
 
-**Automation.** Six Shortcuts actions, a `speedyspaces://` URL scheme, and a CLI — the
-app binary doubles as a command-line tool:
+**Automation.** Six Shortcuts actions, a `speedyspaces://` URL scheme, and a CLI — the app
+binary doubles as a command-line tool:
 
 ```sh
-SpeedySpaces --switch 3     # or --next, --prev, --back, --switcher, --dump
+SpeedySpaces --switch '#3'    # by index; also by name or UUID
+SpeedySpaces --next           # or --prev, --back, --switcher, --dump
 open "speedyspaces://next"
 ```
 
 Names, icons, shortcuts, and preferences export to a single JSON file and restore across
 machines.
-
-![Menu bar strip with per-space icons and the current space](docs/menu-bar.png)
 
 ## Install
 
@@ -82,15 +85,14 @@ To work in Xcode: `xcodegen generate && open SpeedySpaces.xcodeproj`.
 
 ## How it works
 
-Spaces are enumerated through private SkyLight symbols (`CGSCopyManagedDisplaySpaces`
-and friends), resolved at runtime with `dlsym` rather than linked — see `CGSShim.c`.
-Every symbol is feature-detected, so a rename or removal in a future macOS disables the
+Spaces are enumerated through private SkyLight symbols (`CGSCopyManagedDisplaySpaces` and
+friends), resolved at runtime with `dlsym` rather than linked — see `CGSShim.c`. Every
+symbol is feature-detected, so a rename or removal in a future macOS disables the
 dependent feature instead of crashing the app.
 
 Mission Control labels are drawn by a click-through overlay window above the spaces bar;
 tile geometry comes from the public window list, and motion is driven by window-server
-layout notifications, which deliver final tile bounds before the visible animation
-starts.
+layout notifications, which deliver final tile bounds before the visible animation starts.
 
 Switching is pluggable. Pick an engine in Settings:
 
@@ -110,11 +112,12 @@ lives in `~/Library/Application Support/SpeedySpaces/`.
 BIN=build/SpeedySpaces.app/Contents/MacOS/SpeedySpaces
 "$BIN" --selftest    # headless unit suite, 300+ checks
 "$BIN" --dump        # enumerate Spaces as the app sees them
+tests/test.sh        # full suite: unit, read-only, live, and destructive tiers
 ```
 
-`TESTING.md` documents the interactive probes (`--probe-switch`, `--probe-strip`,
-`--probe-switcher`, and others). The research behind the Mission Control overlay —
-measured animation contracts, dead ends, and window-server event surveys — is in
+`TESTING.md` documents the tiers and the interactive probes (`--probe-switch`,
+`--probe-strip`, `--probe-switcher`, and others). The research behind the Mission Control
+overlay — measured animation contracts, dead ends, and window-server event surveys — is in
 `FEASIBILITY.md`, `mission-control-labels.md`, and `fix-workspace-lag.md`.
 
 Source lives in `Sources/SpeedySpaces/`, one concern per file: `SpacesManager`
