@@ -58,10 +58,28 @@ final class MissionControlOverlay: NSObject {
     private var barIDs: [CGWindowID] = []
     private var tileIDs: [CGWindowID] = []
     private var needsRediscovery = false
+    private var discoveryInFlight = false
+    private let scanQueue = DispatchQueue(label: "mco.scan", qos: .userInteractive)
     private var lastDiscovery: CFTimeInterval = 0
     private var lastSpacesRefresh: CFTimeInterval = 0
     private var lastMismatchSig = ""
     private var lastTileRects: [NSRect] = []
+    private var lastBarRects: [NSRect] = []
+    /// Cached geometry between polls (see frame()'s `mustSample`).
+    private var lastSampleResult: (bars: [NSRect], tiles: [(wid: CGWindowID, rect: NSRect)],
+                                   missing: Bool, barsOnScreen: Int) = ([], [], false, 0)
+    private var haveSample = false
+    private var lastSample: CFTimeInterval = 0
+    /// Set by an SLS event or a phase change: take a fresh sample on the next frame no
+    /// matter where the poll cadence sits.
+    private var sampleNow = false
+    /// Safety poll while nothing is being chased — commits announce real changes.
+    private let samplePollInterval: TimeInterval = 1.0 / 15
+    /// Last mapping result, reused on frames that only need a spring step (see frame()).
+    private var lastByScreen: [(screen: NSScreen, labels: [BarLabel], complete: Bool)] = []
+    private var wasSuppressed = false
+    private var wasTilesStill = false
+    private var mappedOnce = false
     /// Tile window -> space uuid, committed while tiles are at rest and ridden while they
     /// move, so labels stay with their spaces through reorder drags (see mapLabels).
     private var tileSpace: [CGWindowID: String] = [:]
@@ -140,6 +158,9 @@ final class MissionControlOverlay: NSObject {
     /// Coalesces an event burst (one event per tile within ~1 ms at a relayout commit)
     /// into a single frame() on the next run-loop turn.
     private var framePending = false
+    /// Wids from 811 births awaiting classification, coalesced per run-loop turn.
+    private var pendingBirths: Set<CGWindowID> = []
+    private var birthsPending = false
     /// Rate limit for 811-triggered probes while closed (811 fires for EVERY window
     /// born in the session, not just Mission Control's).
     private var lastEventProbe: CFTimeInterval = 0
@@ -167,6 +188,17 @@ final class MissionControlOverlay: NSObject {
     private var screenCacheDirty = true
     private var spacesByDisplay: [CGDirectDisplayID: [Space]] = [:]
     private var cachedSpaces: [Space] = []
+
+    // Rendered label content per space uuid. Resolving an SF Symbol is real CoreUI work
+    // and every Prefs getter is a CFPreferences read; doing both per space per frame
+    // measured ~40% of the tracking frame and ~70% of the settled tick. Content only
+    // changes with metadata or prefs, so it is cached until either bumps `contentGen`.
+    // The outer Optional is the cache probe; the inner one caches "renders nothing".
+    private var labelContentCache: [String: (name: String?, icon: NSImage?, key: String)?] = [:]
+    private var iconOverlayCache: [String: (icon: NSImage, key: String)?] = [:]
+    /// Bumped whenever the caches are invalidated; mapLabels re-runs when it changes.
+    private var contentGen = 0
+    private var mappedContentGen = -1
 
     // MARK: - Logging
 
@@ -242,9 +274,23 @@ final class MissionControlOverlay: NSObject {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(spaceChanged),
             name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        // Rendered-content cache invalidation: metadata edits and any prefs write.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(contentSourcesChanged),
+            name: .speedySpacesMetadataChanged, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(contentSourcesChanged),
+            name: UserDefaults.didChangeNotification, object: nil)
         OverlayWindow.onReveal = { [weak self] count, ms in
             self?.dbg("reveal: \(count) labels after \(ms) ms")
         }
+    }
+
+    @objc private func contentSourcesChanged() {
+        labelContentCache.removeAll()
+        iconOverlayCache.removeAll()
+        contentGen += 1
+        if phase != .closed { kickFrame() }
     }
 
     @objc private func spaceChanged() {
@@ -331,7 +377,9 @@ final class MissionControlOverlay: NSObject {
     private func timerTick() {
         switch phase {
         case .closed: probe()
-        case .settled: frame(now: CACurrentMediaTime(), dt: 0, stepSprings: false)
+        case .settled:
+            sampleNow = true            // this watch exists to spot the bar going away
+            frame(now: CACurrentMediaTime(), dt: 0, stepSprings: false)
         case .tracking: break
         }
     }
@@ -339,6 +387,7 @@ final class MissionControlOverlay: NSObject {
     private func enterTracking() {
         phase = .tracking
         stableFrames = 0
+        sampleNow = true
         timer?.invalidate(); timer = nil
         if let link {
             link.isPaused = false
@@ -375,6 +424,11 @@ final class MissionControlOverlay: NSObject {
         link?.invalidate(); link = nil
         stableFrames = 0
         barIDs = []; tileIDs = []; lastTileRects = []
+        lastBarRects = []; lastByScreen = []; mappedOnce = false
+        haveSample = false; sampleNow = false; lastSample = 0; discoveryInFlight = false
+        pendingBirths = []
+        lastSampleResult = ([], [], false, 0)
+        wasSuppressed = false; wasTilesStill = false; mappedContentGen = -1
         clickGates.set((barMaxY: 300, tileRects: []))
         labelAreas.withLock { $0.areas = [] }
         lastMismatchSig = ""
@@ -436,9 +490,14 @@ final class MissionControlOverlay: NSObject {
             // the idle poll's cadence.
             if now - lastEventProbe >= 0.12 { lastEventProbe = now; probe() }
         case 811:
-            unchangedDiscoveries = 0
-            needsRediscovery = true
-            kickFrame()
+            // A window was born somewhere in the session. On this build 811 is NOISY — it
+            // fires for unrelated window churn every few hundred ms, open or not — so
+            // treating each one as "rescan everything" pinned discovery at its 100 ms
+            // cadence for whole sessions. Classify the single new wid instead; only one
+            // too fresh to describe falls back to a scan (the expand case, where tiles are
+            // born at 0x0 and materialise later).
+            pendingBirths.insert(wid)
+            kickBirths()
         case 806, 807:
             guard phase != .closed, tileIDs.contains(wid) || barIDs.contains(wid) else { return }
             replayCommit = true
@@ -447,16 +506,86 @@ final class MissionControlOverlay: NSObject {
             // A tracked window died (804) or committed its teardown (816, observed only
             // at window death on this OS) — usually the dismissal. Confirm through the
             // ordinary frame path now rather than at the settled watch's cadence.
+            // The event already says which wid went, so drop it directly: a full rescan
+            // adds nothing, and leaving the dead wid in the list makes the next sample()
+            // report `missing` and force a synchronous rescan on the frame path anyway.
             guard phase != .closed, tileIDs.contains(wid) || barIDs.contains(wid) else { return }
-            needsRediscovery = true
+            barIDs.removeAll { $0 == wid }
+            tileIDs.removeAll { $0 == wid }
+            unchangedDiscoveries = 0
             kickFrame()
         default:
             break
         }
     }
 
+    /// Classify a burst of freshly born wids with ONE window-server describe call,
+    /// adopting any that are Mission Control's bar/tile windows. Coalesced per run-loop
+    /// turn like kickFrame. A wid that cannot be described yet (born at 0x0, bounds not
+    /// materialised) falls back to the ordinary rediscovery path.
+    private func kickBirths() {
+        guard !birthsPending else { return }
+        birthsPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.birthsPending = false
+            let wids = self.pendingBirths
+            self.pendingBirths = []
+            guard self.phase != .closed, !wids.isEmpty else { return }
+            var adopted = false
+            var unresolved = false
+            for (wid, info) in Self.describeForDiscovery(Array(wids)) {
+                guard let info else { unresolved = true; continue }
+                guard info.owner.isEmpty || info.owner.localizedCaseInsensitiveContains("WindowManager")
+                else { continue }
+                // Adopt only what the full scan would also return. The scan is
+                // on-screen-only; the describe is not, so adopting an off-screen window
+                // here would leave the id lists permanently disagreeing with every
+                // subsequent scan — pinning rediscovery at 100 ms for the whole session.
+                guard info.onscreen else { unresolved = true; continue }
+                switch info.layer {
+                case 14 where !self.barIDs.contains(wid): self.barIDs.append(wid); adopted = true
+                case 15 where !self.tileIDs.contains(wid): self.tileIDs.append(wid); adopted = true
+                default: break
+                }
+            }
+            if adopted {
+                self.unchangedDiscoveries = 0
+                self.subscribeWindowNotifications()
+                self.sampleNow = true
+            }
+            // Unresolvable births are the expand case (tiles born at 0x0): keep the
+            // rediscovery path armed so they're picked up when their bounds appear.
+            if unresolved {
+                self.unchangedDiscoveries = 0
+                self.needsRediscovery = true
+            }
+            if adopted || unresolved { self.kickFrame() }
+        }
+    }
+
+    /// Layer, owner and on-screen flag for specific wids in one call. `nil` value = the
+    /// window server has no description for that wid yet.
+    private static func describeForDiscovery(_ wids: [CGWindowID])
+        -> [CGWindowID: (layer: Int, owner: String, onscreen: Bool)?] {
+        var out: [CGWindowID: (layer: Int, owner: String, onscreen: Bool)?] = [:]
+        for w in wids { out[w] = .some(nil) }
+        var ptrs: [UnsafeRawPointer?] = wids.compactMap { UnsafeRawPointer(bitPattern: UInt($0)) }
+        guard !ptrs.isEmpty,
+              let arr = CFArrayCreate(kCFAllocatorDefault, &ptrs, ptrs.count, nil),
+              let descs = CGWindowListCreateDescriptionFromArray(arr) as? [[String: Any]] else { return out }
+        for d in descs {
+            guard let wid = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value else { continue }
+            out[wid] = .some((layer: (d[kCGWindowLayer as String] as? Int) ?? 0,
+                              owner: (d[kCGWindowOwnerName as String] as? String) ?? "",
+                              onscreen: (d[kCGWindowIsOnscreen as String] as? Bool) ?? false))
+        }
+        return out
+    }
+
     /// One frame() per run-loop turn, no matter how many events land in a burst.
     private func kickFrame() {
+        sampleNow = true
         guard !framePending else { return }
         framePending = true
         DispatchQueue.main.async { [weak self] in
@@ -954,13 +1083,13 @@ final class MissionControlOverlay: NSObject {
     /// Candidates are cached regardless of current size; the per-frame sampler applies the
     /// size bands to live bounds, so tiles mid-morph are found the moment they reach shape.
     /// Returns whether a band-matching bar exists right now (the "Mission Control open" test).
-    @discardableResult
-    private func discover(now: CFTimeInterval) -> Bool {
-        lastDiscovery = now
-        needsRediscovery = false
+    /// The window-list scan itself. PURE and thread-safe (touches no engine state), so it
+    /// can run off-main — the scan costs ~7 ms normally and was measured at up to 204 ms
+    /// while Mission Control composites, which is a dropped frame every time it lands on
+    /// the main thread mid-animation.
+    private static func scanWindows() -> (bars: [CGWindowID], tiles: [CGWindowID], sawBar: Bool) {
         guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
-            barIDs = []; tileIDs = []
-            return false
+            return ([], [], false)
         }
         var bars: [CGWindowID] = []
         var tiles: [CGWindowID] = []
@@ -981,15 +1110,51 @@ final class MissionControlOverlay: NSObject {
                 break
             }
         }
-        if bars == barIDs && tiles == tileIDs {
+        return (bars, tiles, sawBar)
+    }
+
+    /// Adopt a scan result. Main thread only.
+    @discardableResult
+    private func applyScan(_ r: (bars: [CGWindowID], tiles: [CGWindowID], sawBar: Bool)) -> Bool {
+        if r.bars == barIDs && r.tiles == tileIDs {
             unchangedDiscoveries += 1
         } else {
             unchangedDiscoveries = 0
-            barIDs = bars
-            tileIDs = tiles
+            barIDs = r.bars
+            tileIDs = r.tiles
             subscribeWindowNotifications()
+            sampleNow = true
         }
-        return sawBar
+        return r.sawBar
+    }
+
+    /// Synchronous discovery — kept for the paths that must have an answer right now: the
+    /// closed-phase probe (cheap, nothing is compositing) and the dismissal confirm.
+    @discardableResult
+    private func discover(now: CFTimeInterval) -> Bool {
+        lastDiscovery = now
+        needsRediscovery = false
+        return applyScan(Self.scanWindows())
+    }
+
+    /// Background discovery for the open phase, so the scan never blocks a frame. One in
+    /// flight at a time; the result is adopted on main.
+    private func discoverAsync(now: CFTimeInterval) {
+        guard !discoveryInFlight else { return }
+        discoveryInFlight = true
+        statDiscovers += 1
+        lastDiscovery = now
+        needsRediscovery = false
+        scanQueue.async { [weak self] in
+            let r = Self.scanWindows()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.discoveryInFlight = false
+                guard self.phase != .closed else { return }
+                self.applyScan(r)
+                self.kickFrame()
+            }
+        }
     }
 
     private static func barBand(_ s: CGSize) -> Bool { s.width > 600 && s.height > 80 && s.height < 280 }
@@ -1140,9 +1305,25 @@ final class MissionControlOverlay: NSObject {
         let t0 = CACurrentMediaTime()
 
         if needsRediscovery || now - lastDiscovery >= safetyRescanInterval {
-            if now - lastDiscovery >= effectiveRediscoveryInterval { discover(now: now); statDiscovers += 1 }
+            if now - lastDiscovery >= effectiveRediscoveryInterval { discoverAsync(now: now) }
         }
-        var s = sample()
+        // Sampling is one synchronous window-server round-trip per tracked window, and
+        // they BLOCK while WindowManager composites — i.e. during exactly the animations
+        // the labels ride (54% of the tracking frame in the profile). Geometry only
+        // changes at layout commits, which push to us as 806/807 and force a sample via
+        // `sampleNow`. So poll at frame rate ONLY where no event is coming: a drag in
+        // progress (measured: emits no reliable commits) or a bar still materialising its
+        // tiles. Otherwise a slow safety cadence is enough and the frames in between are
+        // pure spring stepping.
+        let mustSample = sampleNow || !haveSample || mouseHeld.get() || awaitingTiles
+            || needsRediscovery || now - lastSample >= samplePollInterval
+        sampleNow = false
+        if mustSample {
+            lastSample = now
+            haveSample = true
+            lastSampleResult = sample()
+        }
+        var s = lastSampleResult
         // Dismissal shows up as windows dying or leaving the on-screen list. Both now lag
         // the visible exit by ~0.5 s (the onscreen flag no longer leads it — see `useSLS`),
         // so this is the BACKSTOP; the AX teardown at +0 ms is the real exit trigger.
@@ -1151,6 +1332,8 @@ final class MissionControlOverlay: NSObject {
             discover(now: now)
             statDiscovers += 1
             s = sample()
+            lastSampleResult = s
+            lastSample = now
         }
         let t1 = CACurrentMediaTime()
         guard !s.bars.isEmpty else {
@@ -1178,9 +1361,9 @@ final class MissionControlOverlay: NSObject {
                 abs($0.rect.minX - $1.minX) < 0.5 && abs($0.rect.minY - $1.minY) < 0.5
                     && abs($0.rect.width - $1.width) < 0.5 && abs($0.rect.height - $1.height) < 0.5
             }
+        let rectsChanged = !tilesStill || s.bars != lastBarRects
         lastTileRects = s.tiles.map(\.rect)
-
-        let byScreen = mapLabels(bars: s.bars, tiles: s.tiles, now: now, tilesAtRest: tilesStill)
+        lastBarRects = s.bars
 
         // An 806/807 commit kicked this frame: the sampled targets are the FINAL bounds
         // of a native relayout whose visible glide is just starting — retarget with the
@@ -1194,9 +1377,25 @@ final class MissionControlOverlay: NSObject {
         // while the (slow) window-state close confirmation is pending. If MC turns out to
         // still be open once the window lapses, updates resume and labels re-reveal.
         let suppressed = now - dismissalAt < 1.0
+        // Mapping walks every space, resolves its content and diffs the label set. Between
+        // layout commits NONE of its inputs move — targets snap once per commit and the
+        // glide in between is played by the springs alone — so re-deriving it every frame
+        // was pure waste. Re-map only when something it reads actually changed; otherwise
+        // this frame is just a spring step.
+        let mustMap = rectsChanged || replay || suppressed != wasSuppressed
+            || contentGen != mappedContentGen || cachedSpaces != spaces.spaces
+            || tilesStill != wasTilesStill || !mappedOnce
+            || overlays.values.contains { $0.isVisible && !$0.hasRevealed }
+        wasSuppressed = suppressed
+        wasTilesStill = tilesStill
+        if !suppressed, mustMap {
+            mappedOnce = true
+            mappedContentGen = contentGen
+            lastByScreen = mapLabels(bars: s.bars, tiles: s.tiles, now: now, tilesAtRest: tilesStill)
+        }
         if !suppressed {
             var active = Set<CGDirectDisplayID>()
-            for (screen, labels, complete) in byScreen {
+            for (screen, labels, complete) in lastByScreen {
                 guard let did = screen.displayID else { continue }
                 active.insert(did)
                 let w = overlay(for: screen, did: did)
@@ -1206,12 +1405,14 @@ final class MissionControlOverlay: NSObject {
                     // managed-space slide (see MCLabelStickySpace) instead of riding it.
                     MCLabelStickySpace.park(w)
                 }
-                let o = screen.frame.origin
-                w.update(labels: labels.map {
-                    BarLabel(id: $0.id, center: NSPoint(x: $0.center.x - o.x, y: $0.center.y - o.y),
-                             name: $0.name, icon: $0.icon, contentKey: $0.contentKey,
-                             placeholderWidth: $0.placeholderWidth)
-                }, now: now, replay: replay, nativeReveal: complete && eventsArmed)
+                if mustMap {
+                    let o = screen.frame.origin
+                    w.update(labels: labels.map {
+                        BarLabel(id: $0.id, center: NSPoint(x: $0.center.x - o.x, y: $0.center.y - o.y),
+                                 name: $0.name, icon: $0.icon, contentKey: $0.contentKey,
+                                 placeholderWidth: $0.placeholderWidth)
+                    }, now: now, replay: replay, nativeReveal: complete && eventsArmed)
+                }
                 if stepSprings {
                     if w.step(dt: dt) { anyMoving = true }
                 } else if w.needsMotion {
@@ -1295,6 +1496,9 @@ final class MissionControlOverlay: NSObject {
         // size), so the label's bottom stays seated at the gap and the larger icon-only
         // rendering only grows upward (still clear of the MacBook notch).
         let labelH2: CGFloat = mcLabelPointSize * 0.6
+        // Prefs getters are CFPreferences reads (lock contention showed in the profile) —
+        // read once per mapping, not once per tile.
+        let namesVisible = Prefs.thumbnailNamesVisible
         for screen in NSScreen.screens {
             guard let did = screen.displayID else { continue }
             let sf = screen.frame
@@ -1348,7 +1552,7 @@ final class MissionControlOverlay: NSObject {
                     labels.append(BarLabel(
                         id: aligned[i].uuid, center: center,
                         name: content.name, icon: content.icon, contentKey: content.key))
-                } else if Prefs.thumbnailNamesVisible {
+                } else if namesVisible {
                     // Unnamed space, names enabled: a blank caption occupying the click target
                     // so the user can click where a name would be to open the rename editor.
                     let w = tile.rect.width * placeholderWidthFraction
@@ -1396,6 +1600,13 @@ final class MissionControlOverlay: NSObject {
     /// key folds in size/weight so a settings change mid-session re-renders live labels. The
     /// `.largeOver` style's icon is a separate centered label (`iconOverlayContent`), not here.
     private func labelContent(_ space: Space) -> (name: String?, icon: NSImage?, key: String)? {
+        if let cached = labelContentCache[space.uuid] { return cached }
+        let computed = computeLabelContent(space)
+        labelContentCache[space.uuid] = computed
+        return computed
+    }
+
+    private func computeLabelContent(_ space: Space) -> (name: String?, icon: NSImage?, key: String)? {
         let meta = store.metadata(for: space.uuid)
         var name: String?
         if Prefs.thumbnailNamesVisible, let n = meta.name, !n.isEmpty { name = n }
@@ -1414,6 +1625,13 @@ final class MissionControlOverlay: NSObject {
 
     /// The `.largeOver` style's icon, centered on the thumbnail as its own label.
     private func iconOverlayContent(_ space: Space) -> (icon: NSImage, key: String)? {
+        if let cached = iconOverlayCache[space.uuid] { return cached }
+        let computed = computeIconOverlayContent(space)
+        iconOverlayCache[space.uuid] = computed
+        return computed
+    }
+
+    private func computeIconOverlayContent(_ space: Space) -> (icon: NSImage, key: String)? {
         guard Prefs.thumbnailIconStyle == .largeOver else { return nil }
         let meta = store.metadata(for: space.uuid)
         guard let image = IconRendering.image(for: meta, pointSize: mcIconPointSize) else { return nil }
@@ -1641,6 +1859,11 @@ private final class OverlayWindow: NSPanel {
 
     /// Whether any label still has distance to cover (drives the engine's settle logic).
     var needsMotion: Bool { items.values.contains { !$0.settled } }
+
+    /// Whether the reveal has already fired. The engine keeps re-mapping while a visible
+    /// overlay is unrevealed, so the fallback reveal gate still gets the repeated updates
+    /// it needs to time out (see frame()'s `mustMap`).
+    var hasRevealed: Bool { revealed }
 
     /// Window-local hit rects of the revealed labels, keyed by space uuid, with a small
     /// slop so the thin text row is a comfortable click target. Main thread only — the

@@ -1,6 +1,7 @@
 # XcodeGen spec. Run `xcodegen generate` to produce SpeedySpaces.xcodeproj,
-# then open in Xcode. (Requires full Xcode; the repo also builds via ./build.sh
-# using only Command Line Tools.)
+# then open in Xcode. ./build.sh builds the same sources from the command line,
+# and also requires full Xcode — xcodebuild refuses to run under the bare Command
+# Line Tools, and the App Intents metadata step needs Xcode's toolchain.
 name: SpeedySpaces
 options:
   bundleIdPrefix: com.speedyspaces
