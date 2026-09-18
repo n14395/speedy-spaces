@@ -78,6 +78,52 @@ final class MissionControlOverlay: NSObject {
     /// Set by an SLS event or a phase change: take a fresh sample on the next frame no
     /// matter where the poll cadence sits.
     private var sampleNow = false
+    /// The sampler's own queue. Sampling is one synchronous window-server round-trip per
+    /// tracked window, and those round-trips BLOCK for as long as WindowManager takes to
+    /// composite a relayout — 130 ms typically, 567 ms once, on an add/remove
+    /// (fix-workspace-lag.md). An add or remove is the one interaction that lands SEVERAL
+    /// commits 60–130 ms apart (probe/captures/final.log: 806 bursts at +0, +129 and
+    /// +189 ms), so the second and third commit samples ran while the first glide was
+    /// compositing and froze the main thread — and with it every label — mid-glide.
+    /// Off-main, the frames keep stepping the springs against the last targets and the
+    /// fresh ones are applied the moment the round-trip returns (`applySample`).
+    /// MCO_SYNC_SAMPLE=1 restores the in-frame synchronous sample for A/B measurement.
+    private let sampleQueue = DispatchQueue(label: "mco.sample", qos: .userInteractive)
+    /// Serial queue for the fire-and-forget window-server calls that used to run on main
+    /// (the per-window notification subscription). Serial so a later subscription can
+    /// never be overtaken by an earlier one.
+    private let slsQueue = DispatchQueue(label: "mco.sls", qos: .userInteractive)
+    private let asyncSampling = ProcessInfo.processInfo.environment["MCO_SYNC_SAMPLE"] == nil
+    private var sampleInFlight = false
+    /// A commit demanded a sample while one was in flight: run one more straight after,
+    /// so the newest commit's targets are never skipped — and whether that follow-up
+    /// answers a replay commit.
+    private var sampleWanted = false
+    private var wantedReplay = false
+    private var wantedReplayAt: CFTimeInterval = 0
+    /// Replay marking of the sample the current `retargetOnly` frame applies (see frame()),
+    /// and WHICH commit that sample answers. The timestamp has to travel with the sample:
+    /// bursts arrive while a round-trip is out, so by the time the answer lands
+    /// `lastCommitAt` may already name a LATER commit, and measuring the glide's head start
+    /// against that one puts the labels a burst out of phase with the tiles.
+    private var appliedReplay = false
+    private var appliedReplayAt: CFTimeInterval = 0
+    /// Bumped on close so a round-trip from a dead session is dropped on arrival.
+    private var sessionGen = 0
+    /// Monotonic counts of adopted scans and samples, used to tell when a confirm cycle
+    /// (below) has actually come back rather than merely been asked for.
+    private var scansApplied = 0
+    private var samplesApplied = 0
+    /// A sample looked wrong (a tracked window had no bounds, the bar is gone, every tile
+    /// vanished). Rather than concluding — which used to mean a synchronous window-list
+    /// scan AND a synchronous re-sample on the frame path, a latent 200 ms + 350 ms
+    /// main-thread block — a rescan and resample are ordered off-main and the verdict
+    /// waits for them. These hold the counts at the moment the cycle started; -1 = none.
+    private var confirmAtScan = -1
+    private var confirmAtSample = -1
+    /// When the bar first went missing, so a confirm that never lands can't hold a closed
+    /// Mission Control open forever.
+    private var barsGoneSince: CFTimeInterval = 0
     /// Safety poll while nothing is being chased — commits announce real changes.
     private let samplePollInterval: TimeInterval = 1.0 / 15
     /// Last mapping result, reused on frames that only need a spring step (see frame()).
@@ -163,6 +209,25 @@ final class MissionControlOverlay: NSObject {
     /// Set by an 806/807 arrival; consumed by the next frame(), which retargets the
     /// labels with the native REPLAY spring instead of the fallback pursuit/layout ones.
     private var replayCommit = false
+    /// When the most recent 806/807 arrived. The tiles start their glide at that instant,
+    /// so the labels' replay is begun that far in the past (see OverlayWindow.caGlide) —
+    /// whatever the sample and the commit cost us, the curve is entered at the phase the
+    /// tiles are already at rather than restarted from zero.
+    private var lastCommitAt: CFTimeInterval = 0
+    /// Final bounds read INSIDE the 806/807 callback, for the very window each event names.
+    /// A relayout delivers one event per tile within ~1.6 ms and the window server already
+    /// has that window's committed rect, so one query per event hands us the whole new
+    /// layout by the end of the burst — without waiting for the sampler's round-trip,
+    /// which measured 15-45 ms (and much worse under load). That wait was the labels
+    /// sitting still and then jumping to catch up: the curve was started at the right
+    /// PHASE, but only once the answer arrived. Consumed by the next frame().
+    private var eventBounds: [CGWindowID: NSRect] = [:]
+    /// Main-thread time already spent on those queries in the current burst. They are
+    /// window-server round-trips on the main thread — the thing this whole exercise moved
+    /// off it — so they are strictly budgeted, and the async sampler covers whatever the
+    /// budget refuses.
+    private var eventBoundsSpent: CFTimeInterval = 0
+    private let eventBoundsBudget: CFTimeInterval = 0.006
     /// Coalesces an event burst (one event per tile within ~1 ms at a relayout commit)
     /// into a single frame() on the next run-loop turn.
     private var framePending = false
@@ -236,6 +301,15 @@ final class MissionControlOverlay: NSObject {
         logLine(s())
     }
 
+    /// Debug-only main-run-loop stall attribution. A `frame gap` says the labels stood
+    /// still; this says WHY — "busy" means the main thread was inside a call (a
+    /// window-server round-trip, a CoreAnimation commit), "idle" means it had nothing
+    /// scheduled and neither the display link nor the backstop woke it. Installed for the
+    /// duration of a Mission Control session.
+    private var loopObserver: CFRunLoopObserver?
+    private var loopAwakeAt: CFTimeInterval = 0
+    private var loopSleptAt: CFTimeInterval = 0
+
     // Per-frame cost accounting, reported every 120 frames while logging is on.
     private var statN = 0
     private var statSum = 0.0
@@ -245,6 +319,9 @@ final class MissionControlOverlay: NSObject {
     private var statApplySum = 0.0
     private var statDiscovers = 0
     private var statRefreshes = 0
+    private var statSamples = 0
+    private var statSampleMaxUs = 0        // slowest round-trip in the window
+    private var statSampleLatMaxUs = 0     // longest request→apply latency in the window
 
     /// Offset (points) between the label's bottom and the TILE WINDOW's top edge. The tile
     /// window extends ~13 pt above the visible wallpaper thumbnail, so this is negative to
@@ -291,6 +368,11 @@ final class MissionControlOverlay: NSObject {
             name: UserDefaults.didChangeNotification, object: nil)
         OverlayWindow.onReveal = { [weak self] count, ms in
             self?.dbg("reveal: \(count) labels after \(ms) ms")
+        }
+        if debugLog {
+            OverlayWindow.onAlpha = { [weak self] whence, report in
+                self?.logLine("alpha \(whence): \(report)")
+            }
         }
     }
 
@@ -392,6 +474,42 @@ final class MissionControlOverlay: NSObject {
         }
     }
 
+    /// See `loopObserver`. Debug builds only, and only while Mission Control is open.
+    private func startLoopWatch() {
+        guard debugLog, loopObserver == nil else { return }
+        let obs = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault,
+            CFRunLoopActivity.afterWaiting.rawValue | CFRunLoopActivity.beforeWaiting.rawValue,
+            true, 0
+        ) { [weak self] _, activity in
+            guard let self else { return }
+            let now = CACurrentMediaTime()
+            if activity == .afterWaiting {
+                self.loopAwakeAt = now
+                let idle = now - self.loopSleptAt
+                if self.loopSleptAt > 0, idle >= 0.04, self.phase == .tracking {
+                    self.dbg("main idle \(Int(idle * 1000)) ms — run loop slept, nothing woke it")
+                }
+            } else {
+                self.loopSleptAt = now
+                let busy = now - self.loopAwakeAt
+                if self.loopAwakeAt > 0, busy >= 0.04 {
+                    self.dbg("main busy \(Int(busy * 1000)) ms — blocked in a call, not in frame()")
+                }
+            }
+        }
+        guard let obs else { return }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), obs, .commonModes)
+        loopObserver = obs
+        loopAwakeAt = 0; loopSleptAt = 0
+    }
+
+    private func stopLoopWatch() {
+        guard let obs = loopObserver else { return }
+        CFRunLoopRemoveObserver(CFRunLoopGetMain(), obs, .commonModes)
+        loopObserver = nil
+    }
+
     private func enterTracking() {
         phase = .tracking
         stableFrames = 0
@@ -434,11 +552,16 @@ final class MissionControlOverlay: NSObject {
         NotificationCenter.default.post(name: .speedySpacesMissionControlClosed, object: nil)
         removeDismissTap()
         stopAXWatch()
+        stopLoopWatch()
         link?.invalidate(); link = nil
         stableFrames = 0
         barIDs = []; tileIDs = []; lastTileRects = []
         lastBarRects = []; lastByScreen = []; mappedOnce = false
         haveSample = false; sampleNow = false; lastSample = 0; discoveryInFlight = false
+        sessionGen += 1; sampleInFlight = false; sampleWanted = false
+        wantedReplay = false; appliedReplay = false
+        confirmAtScan = -1; confirmAtSample = -1; barsGoneSince = 0
+        wantedReplayAt = 0; appliedReplayAt = 0; lastCommitAt = 0
         pendingBirths = []
         lastSampleResult = ([], [], false, 0)
         wasSuppressed = false; wasTilesStill = false; mappedContentGen = -1
@@ -461,9 +584,11 @@ final class MissionControlOverlay: NSObject {
         if statN > 0 {
             dbg("frame µs min=\(Int(statMin)) avg=\(Int(statSum / Double(statN))) max=\(Int(statMax))"
                 + " sampleAvg=\(Int(statSampleSum / Double(statN))) applyAvg=\(Int(statApplySum / Double(statN)))"
-                + " discovers=\(statDiscovers) refreshes=\(statRefreshes) n=\(statN)")
+                + " discovers=\(statDiscovers) refreshes=\(statRefreshes)"
+                + " samples=\(statSamples) rtMax=\(statSampleMaxUs)µs latMax=\(statSampleLatMaxUs)µs n=\(statN)")
             statN = 0; statSum = 0; statMin = .infinity; statMax = 0
             statSampleSum = 0; statApplySum = 0; statDiscovers = 0; statRefreshes = 0
+            statSamples = 0; statSampleMaxUs = 0; statSampleLatMaxUs = 0
         }
         dbg("MC closed")
     }
@@ -480,6 +605,7 @@ final class MissionControlOverlay: NSObject {
             dbg("MC open: barWindows=\(barIDs.count) tileWindows=\(tileIDs.count)")
             installDismissTap()
             startAXWatch()
+            startLoopWatch()
             enterTracking()
             frame(now: now, dt: 0, stepSprings: false)
         } else if burstUntil > 0, now >= burstUntil {
@@ -514,7 +640,20 @@ final class MissionControlOverlay: NSObject {
             kickBirths()
         case 806, 807:
             guard phase != .closed, tileIDs.contains(wid) || barIDs.contains(wid) else { return }
+            if !replayCommit { lastCommitAt = now; eventBoundsSpent = 0 }
             replayCommit = true
+            // Read this window's committed rect while we are already here. Budgeted: if
+            // the window server is making these slow (it is compositing the very relayout
+            // being announced), stop and let the off-main sampler answer instead.
+            if eventBoundsSpent < eventBoundsBudget, primaryH > 0 {
+                let t0 = CACurrentMediaTime()
+                var r = CGRect.zero
+                if sm_getWindowBounds(wid, &r), Self.tileBand(r.size) || Self.barBand(r.size) {
+                    eventBounds[wid] = NSRect(x: r.minX, y: primaryH - r.minY - r.height,
+                                              width: r.width, height: r.height)
+                }
+                eventBoundsSpent += CACurrentMediaTime() - t0
+            }
             kickFrame()
         case 804, 816:
             // A tracked window died (804) or committed its teardown (816, observed only
@@ -546,36 +685,59 @@ final class MissionControlOverlay: NSObject {
             let wids = self.pendingBirths
             self.pendingBirths = []
             guard self.phase != .closed, !wids.isEmpty else { return }
-            var adopted = false
-            var unresolved = false
-            for (wid, info) in Self.describeForDiscovery(Array(wids)) {
-                guard let info else { unresolved = true; continue }
-                guard info.owner.isEmpty || info.owner.localizedCaseInsensitiveContains("WindowManager")
-                else { continue }
-                // Adopt only what the full scan would also return. The scan is
-                // on-screen-only; the describe is not, so adopting an off-screen window
-                // here would leave the id lists permanently disagreeing with every
-                // subsequent scan — pinning rediscovery at 100 ms for the whole session.
-                guard info.onscreen else { unresolved = true; continue }
-                switch info.layer {
-                case 14 where !self.barIDs.contains(wid): self.barIDs.append(wid); adopted = true
-                case 15 where !self.tileIDs.contains(wid): self.tileIDs.append(wid); adopted = true
-                default: break
+            // The describe is a window-server round-trip, and on an add the births land
+            // ~13 ms after a relayout commit (probe/captures/final.log) — inside the
+            // compositing window where such round-trips block (see `sampleQueue`).
+            // Off-main; the adoption itself happens on main.
+            let gen = self.sessionGen
+            self.scanQueue.async { [weak self] in
+                let t0 = CACurrentMediaTime()
+                let described = Self.describeForDiscovery(Array(wids))
+                let us = Int((CACurrentMediaTime() - t0) * 1_000_000)
+                DispatchQueue.main.async { [weak self] in
+                    self?.adoptBirths(described, gen: gen, roundTripUs: us)
                 }
             }
-            if adopted {
-                self.unchangedDiscoveries = 0
-                self.subscribeWindowNotifications()
-                self.sampleNow = true
-            }
-            // Unresolvable births are the expand case (tiles born at 0x0): keep the
-            // rediscovery path armed so they're picked up when their bounds appear.
-            if unresolved {
-                self.unchangedDiscoveries = 0
-                self.needsRediscovery = true
-            }
-            if adopted || unresolved { self.kickFrame() }
         }
+    }
+
+    /// Main thread: classify a described burst of births, adopting any that are Mission
+    /// Control's bar/tile windows.
+    private func adoptBirths(_ described: [CGWindowID: (layer: Int, owner: String, onscreen: Bool)?],
+                             gen: Int, roundTripUs: Int) {
+        guard gen == sessionGen, phase != .closed else { return }
+        if debugLog, roundTripUs >= 2_000 {
+            dbg("births: describe of \(described.count) wids took \(roundTripUs) µs off-main")
+        }
+        var adopted = false
+        var unresolved = false
+        for (wid, info) in described {
+            guard let info else { unresolved = true; continue }
+            guard info.owner.isEmpty || info.owner.localizedCaseInsensitiveContains("WindowManager")
+            else { continue }
+            // Adopt only what the full scan would also return. The scan is
+            // on-screen-only; the describe is not, so adopting an off-screen window
+            // here would leave the id lists permanently disagreeing with every
+            // subsequent scan — pinning rediscovery at 100 ms for the whole session.
+            guard info.onscreen else { unresolved = true; continue }
+            switch info.layer {
+            case 14 where !barIDs.contains(wid): barIDs.append(wid); adopted = true
+            case 15 where !tileIDs.contains(wid): tileIDs.append(wid); adopted = true
+            default: break
+            }
+        }
+        if adopted {
+            unchangedDiscoveries = 0
+            subscribeWindowNotifications()
+            sampleNow = true
+        }
+        // Unresolvable births are the expand case (tiles born at 0x0): keep the
+        // rediscovery path armed so they're picked up when their bounds appear.
+        if unresolved {
+            unchangedDiscoveries = 0
+            needsRediscovery = true
+        }
+        if adopted || unresolved { kickFrame() }
     }
 
     /// Layer, owner and on-screen flag for specific wids in one call. `nil` value = the
@@ -613,12 +775,28 @@ final class MissionControlOverlay: NSObject {
     /// (Re)request per-window notifications for the current bar+tile set. Stale wids in
     /// an earlier request are inert, so the fresh list goes out whenever the set changes
     /// (wids are new every Mission Control session).
+    ///
+    /// Off-main, and that matters: `SLSRequestNotificationsForWindows` is a window-server
+    /// round-trip, and the moment it is called is precisely the worst one — adopting the
+    /// new tile on a desktop add lands it inside WindowManager's relayout compositing,
+    /// where it blocked the main thread for 40–80 ms (measured 2026-09-18: a `frame gap`
+    /// immediately after every `births:` line, in stat windows whose slowest frame was
+    /// under 3 ms, so the stall was outside frame() entirely). Fire-and-forget on a
+    /// serial queue: requests go out in order and a later, fuller list supersedes an
+    /// earlier one.
     private func subscribeWindowNotifications() {
         guard eventsArmed else { return }
-        var wids = barIDs + tileIDs
+        let wids = barIDs + tileIDs
         guard !wids.isEmpty else { return }
-        if !sm_slsSubscribeWindowNotifications(&wids, Int32(wids.count)) {
-            dbg("SLS window subscription failed (\(wids.count) wids)")
+        slsQueue.async { [weak self] in
+            var w = wids
+            let t0 = CACurrentMediaTime()
+            let ok = sm_slsSubscribeWindowNotifications(&w, Int32(w.count))
+            let us = Int((CACurrentMediaTime() - t0) * 1_000_000)
+            guard !ok || us >= 5_000 else { return }
+            DispatchQueue.main.async {
+                self?.dbg("SLS subscribe \(w.count) wids: \(ok ? "ok" : "FAILED") in \(us) µs off-main")
+            }
         }
     }
 
@@ -1130,6 +1308,7 @@ final class MissionControlOverlay: NSObject {
     /// Adopt a scan result. Main thread only.
     @discardableResult
     private func applyScan(_ r: (bars: [CGWindowID], tiles: [CGWindowID], sawBar: Bool)) -> Bool {
+        scansApplied += 1
         if r.bars == barIDs && r.tiles == tileIDs {
             unchangedDiscoveries += 1
         } else {
@@ -1240,11 +1419,22 @@ final class MissionControlOverlay: NSObject {
     /// zero means Mission Control itself is going (exit fade); non-zero with `bars` empty means
     /// the bar merely collapsed/left its band (fade). Judged from live sampling, never from
     /// the discovery ID cache, which can lag the screen by a scan.
-    private func sample() -> (bars: [NSRect], tiles: [(wid: CGWindowID, rect: NSRect)],
-                              missing: Bool, barsOnScreen: Int) {
+    private typealias Sample = (bars: [NSRect], tiles: [(wid: CGWindowID, rect: NSRect)],
+                                missing: Bool, barsOnScreen: Int)
+
+    /// The window-server round-trips themselves, one per tracked window. PURE (touches no
+    /// engine state) so it can run on `sampleQueue`. `missingWids` are the tracked wids
+    /// the server had nothing for — reported by id so the main thread can discount any
+    /// that an 804 pruned while the round-trip was out.
+    private static func sampleWindows(bars barIDs: [CGWindowID], tiles tileIDs: [CGWindowID],
+                                      useSLS: Bool, primaryH: CGFloat)
+        -> (sample: Sample, missingWids: [CGWindowID]) {
+        func toNS(_ cg: CGRect) -> NSRect {
+            NSRect(x: cg.minX, y: primaryH - cg.minY - cg.height, width: cg.width, height: cg.height)
+        }
         var bars: [NSRect] = []
         var tiles: [(wid: CGWindowID, rect: NSRect)] = []
-        var missing = false
+        var missingWids: [CGWindowID] = []
         var barsOnScreen = 0
         if useSLS {
             for wid in barIDs {
@@ -1252,13 +1442,13 @@ final class MissionControlOverlay: NSObject {
                 if sm_getWindowBounds(wid, &r) {
                     barsOnScreen += 1
                     if Self.barBand(r.size) { bars.append(toNS(r)) }
-                } else { missing = true }
+                } else { missingWids.append(wid) }
             }
             for wid in tileIDs {
                 var r = CGRect.zero
                 if sm_getWindowBounds(wid, &r) {
                     if Self.tileBand(r.size) { tiles.append((wid, toNS(r))) }
-                } else { missing = true }
+                } else { missingWids.append(wid) }
             }
         } else {
             let map = Self.describeWindows(barIDs + tileIDs)
@@ -1268,18 +1458,99 @@ final class MissionControlOverlay: NSObject {
                         barsOnScreen += 1
                         if Self.barBand(r.size) { bars.append(toNS(r)) }
                     }
-                } else { missing = true }
+                } else { missingWids.append(wid) }
             }
             for wid in tileIDs {
                 if let (r, on) = map[wid] {
                     if on, Self.tileBand(r.size) { tiles.append((wid, toNS(r))) }
-                } else { missing = true }
+                } else { missingWids.append(wid) }
             }
         }
         // Deterministic order: discovery returns z-order, which can shuffle between scans;
         // the stability comparison and tile→ordinal mapping both need positional order.
         tiles.sort { $0.rect.minX < $1.rect.minX }
-        return (bars, tiles, missing, barsOnScreen)
+        return ((bars, tiles, !missingWids.isEmpty, barsOnScreen), missingWids)
+    }
+
+    /// Ask for fresh geometry. Off-main by default (see `sampleQueue`): the round-trip
+    /// runs on the sampler queue and `applySample` retargets on main the moment it
+    /// returns, so a blocked round-trip costs the labels nothing but the wait for the new
+    /// targets — the springs keep stepping meanwhile. One round-trip in flight at a
+    /// time; an `urgent` demand (a commit) that lands mid-flight queues exactly one more,
+    /// a steady one (drag / poll) is simply absorbed. `replay` is the commit's replay
+    /// marking, carried to the frame that applies the answer.
+    private func requestSample(now: CFTimeInterval, urgent: Bool, replay: Bool,
+                               replayAt: CFTimeInterval = 0) {
+        guard asyncSampling else {
+            // A/B path (MCO_SYNC_SAMPLE=1): block this frame, as the engine always did.
+            let t0 = CACurrentMediaTime()
+            let r = Self.sampleWindows(bars: barIDs, tiles: tileIDs, useSLS: useSLS, primaryH: primaryH)
+            noteSample(r, now: now, roundTripUs: Int((CACurrentMediaTime() - t0) * 1_000_000), latencyUs: 0)
+            return
+        }
+        if sampleInFlight {
+            if urgent {
+                sampleWanted = true
+                if replay { wantedReplay = true; wantedReplayAt = replayAt }
+            }
+            return
+        }
+        sampleInFlight = true
+        let gen = sessionGen, bars = barIDs, tiles = tileIDs, sls = useSLS, ph = primaryH
+        sampleQueue.async { [weak self] in
+            let t0 = CACurrentMediaTime()
+            let r = Self.sampleWindows(bars: bars, tiles: tiles, useSLS: sls, primaryH: ph)
+            let us = Int((CACurrentMediaTime() - t0) * 1_000_000)
+            DispatchQueue.main.async { [weak self] in
+                self?.applySample(r, gen: gen, requestedAt: now, roundTripUs: us,
+                                  replay: replay, replayAt: replayAt)
+            }
+        }
+    }
+
+    /// Main thread: a round-trip came back. Adopt it, issue the follow-up a mid-flight
+    /// commit asked for, and retarget NOW rather than on the next link tick.
+    private func applySample(_ r: (sample: Sample, missingWids: [CGWindowID]), gen: Int,
+                             requestedAt: CFTimeInterval, roundTripUs: Int, replay: Bool,
+                             replayAt: CFTimeInterval) {
+        guard gen == sessionGen else { return }   // a dead session's round-trip
+        sampleInFlight = false
+        guard phase != .closed else { return }
+        let now = CACurrentMediaTime()
+        noteSample(r, now: now, roundTripUs: roundTripUs,
+                   latencyUs: Int((now - requestedAt) * 1_000_000))
+        if sampleWanted {
+            sampleWanted = false
+            let again = wantedReplay
+            let againAt = wantedReplayAt
+            wantedReplay = false; wantedReplayAt = 0
+            requestSample(now: now, urgent: true, replay: again, replayAt: againAt)
+        }
+        appliedReplay = replay
+        appliedReplayAt = replayAt
+        frame(now: now, dt: 0, stepSprings: false, retargetOnly: true)
+    }
+
+    /// Adopt a sample as the current geometry. A wid the event path pruned (804) while
+    /// the round-trip was out is not `missing` — it is simply gone.
+    private func noteSample(_ r: (sample: Sample, missingWids: [CGWindowID]), now: CFTimeInterval,
+                            roundTripUs: Int, latencyUs: Int) {
+        var s = r.sample
+        let tracked = Set(barIDs + tileIDs)
+        s.missing = r.missingWids.contains { tracked.contains($0) }
+        s.tiles.removeAll { !tracked.contains($0.wid) }
+        lastSampleResult = s
+        haveSample = true
+        lastSample = now
+        samplesApplied += 1
+        statSamples += 1
+        statSampleMaxUs = max(statSampleMaxUs, roundTripUs)
+        statSampleLatMaxUs = max(statSampleLatMaxUs, latencyUs)
+        if debugLog, roundTripUs >= 2_000 || latencyUs >= 8_000 {
+            dbg("sample: \(s.bars.count) bars \(s.tiles.count) tiles, round-trip \(roundTripUs) µs"
+                + (asyncSampling ? " off-main, applied \(latencyUs / 1000) ms after request"
+                                 : " ON MAIN (MCO_SYNC_SAMPLE)"))
+        }
     }
 
     /// Bounds + onscreen flag for a specific set of windows — one small window-server query,
@@ -1299,10 +1570,6 @@ final class MissionControlOverlay: NSObject {
             out[wid] = (cg, (d[kCGWindowIsOnscreen as String] as? Bool) ?? true)
         }
         return out
-    }
-
-    private func toNS(_ cg: CGRect) -> NSRect {
-        NSRect(x: cg.minX, y: primaryH - cg.minY - cg.height, width: cg.width, height: cg.height)
     }
 
     // MARK: - Per-frame drive
@@ -1326,10 +1593,17 @@ final class MissionControlOverlay: NSObject {
         // it (app suspended, display sleep) should snap to the settled layout anyway.
         let dt = min(max(now - lastFrame, 0), 0.5)
         lastFrame = now
+        // Neither the link nor the 60 Hz backstop got a frame in for ≥40 ms: the main
+        // thread was blocked, and the labels stood still for exactly this long.
+        if debugLog, dt >= 0.04 { dbg("frame gap \(Int(dt * 1000)) ms") }
         frame(now: now, dt: dt, stepSprings: true)
     }
 
-    private func frame(now: CFTimeInterval, dt: CFTimeInterval, stepSprings: Bool) {
+    /// `retargetOnly`: this frame applies inputs that just arrived (a sample, a space
+    /// list) and must not START anything — no steady-state sample request, so a drag keeps
+    /// sampling at the link's rate rather than chaining at the round-trip's.
+    private func frame(now: CFTimeInterval, dt: CFTimeInterval, stepSprings: Bool,
+                       retargetOnly: Bool = false) {
         guard phase != .closed else { return }
         let t0 = CACurrentMediaTime()
 
@@ -1356,34 +1630,92 @@ final class MissionControlOverlay: NSObject {
         // keeping it here only meant a permanent tile/space disagreement (exactly what an
         // add or remove creates) pinned the blocking sampler at frame rate.
         let gliding = springsFlying && wasTilesStill
-        let mustSample = sampleNow || !haveSample || mouseHeld.get() || awaitingTiles
-            || (!gliding && now - lastSample >= samplePollInterval)
+        let demand = sampleNow
         sampleNow = false
-        if mustSample {
-            lastSample = now
-            haveSample = true
-            lastSampleResult = sample()
+        let steady = !retargetOnly && (mouseHeld.get() || awaitingTiles
+            || (!gliding && now - lastSample >= samplePollInterval))
+        // Bounds the commit's own callbacks already read (see `eventBounds`).
+        let eventTiles = eventBounds
+        eventBounds.removeAll()
+        var replay = false
+        var replayAt: CFTimeInterval = 0
+        if asyncSampling {
+            // The replay marking travels WITH the geometry that answers the commit. When
+            // the callbacks supplied it, that is THIS frame and the glide starts now; the
+            // sample still goes out, but only to confirm. Otherwise the marking rides the
+            // request and comes back with the answer (`appliedReplay`) — consuming it on
+            // the frame that merely issued the request would spend it on stale targets.
+            if demand {
+                if !eventTiles.isEmpty, replayCommit {
+                    replay = true
+                    replayAt = lastCommitAt
+                    requestSample(now: now, urgent: true, replay: false)
+                } else {
+                    requestSample(now: now, urgent: true, replay: replayCommit, replayAt: lastCommitAt)
+                }
+                replayCommit = false
+            } else if steady || (!haveSample && !sampleInFlight) {
+                requestSample(now: now, urgent: false, replay: false)
+            }
+            if !replay { replay = appliedReplay; replayAt = appliedReplayAt }
+            appliedReplay = false
+        } else {
+            if demand || steady || !haveSample { requestSample(now: now, urgent: demand, replay: false) }
+            replay = replayCommit
+            replayAt = lastCommitAt
+            replayCommit = false
         }
+        // Nothing to act on until the session's first round-trip returns — the empty
+        // placeholder must not read as "bar gone".
+        guard haveSample else { return }
         var s = lastSampleResult
+        if !eventTiles.isEmpty {
+            var merged = 0
+            for i in s.tiles.indices where eventTiles[s.tiles[i].wid] != nil {
+                s.tiles[i].rect = eventTiles[s.tiles[i].wid]!
+                merged += 1
+            }
+            if merged > 0 {
+                s.tiles.sort { $0.rect.minX < $1.rect.minX }
+                lastSampleResult = s
+                if debugLog, replay {
+                    dbg("commit geometry from \(merged) event callbacks — no round-trip wait")
+                }
+            }
+        }
         // Dismissal shows up as windows dying or leaving the on-screen list. Both now lag
         // the visible exit by ~0.5 s (the onscreen flag no longer leads it — see `useSLS`),
         // so this is the BACKSTOP; the AX teardown at +0 ms is the real exit trigger.
-        // Confirm any of these with a fresh discovery scan before concluding anything.
+        // Confirm any of these with a fresh scan and sample before concluding anything —
+        // ordered here, judged when they land (see `confirmAtScan`). The discovery's
+        // completion republishes `sampleNow`, so the sample always follows the scan.
         if s.missing || s.bars.isEmpty || (s.tiles.isEmpty && !lastTileRects.isEmpty) {
-            discover(now: now)
-            statDiscovers += 1
-            s = sample()
-            lastSampleResult = s
-            lastSample = now
+            if confirmAtScan < 0 {
+                confirmAtScan = scansApplied
+                confirmAtSample = samplesApplied
+                needsRediscovery = true
+                discoverAsync(now: now)
+            }
+        } else {
+            confirmAtScan = -1
         }
+        let confirmed = confirmAtScan >= 0
+            && scansApplied > confirmAtScan && samplesApplied > confirmAtSample
+        if confirmed { confirmAtScan = -1 }
         let t1 = CACurrentMediaTime()
-        guard !s.bars.isEmpty else {
+        if s.bars.isEmpty {
             // No bar windows on screen at all => Mission Control itself is dismissing and
             // the tiles are flying up — ride with them. A bar window that's still on screen
             // but collapsed/out of band is not a dismissal — plain fade.
-            close(dismissing: s.barsOnScreen == 0)
+            // Hold the verdict until the confirm cycle agrees the bar is really gone; the
+            // 0.5 s bound keeps a confirm that never lands from pinning the session open.
+            if barsGoneSince == 0 { barsGoneSince = now }
+            if confirmed || now - barsGoneSince >= 0.5 {
+                close(dismissing: s.barsOnScreen == 0)
+            }
             return
         }
+        barsGoneSince = 0
         // Bar bottom + tile rects in CG coords (undo the NS flip) for the tap thread's
         // click-dismissal gates.
         let tileRectsCG = s.tiles.map {
@@ -1406,12 +1738,15 @@ final class MissionControlOverlay: NSObject {
         lastTileRects = s.tiles.map(\.rect)
         lastBarRects = s.bars
 
-        // An 806/807 commit kicked this frame: the sampled targets are the FINAL bounds
+        // This frame applies an 806/807 commit's sample: the targets are the FINAL bounds
         // of a native relayout whose visible glide is just starting — retarget with the
         // matched replay spring so the labels play the same curve from the same instant.
-        let replay = replayCommit
-        replayCommit = false
-        if replay { dbg("replay commit — retargeting on the native curve") }
+        // How far into the native glide the tiles already are. Everything between the
+        // window server's commit and this frame — the event hop, the sample round-trip,
+        // a blocked main thread — is time the tiles have been moving and the labels have
+        // not, so the replay is entered at that phase instead of from the start.
+        let commitAge = replay && replayAt > 0 ? min(max(now - replayAt, 0), 0.3) : 0
+        if replay { dbg("replay commit — retargeting on the native curve, \(Int(commitAge * 1000)) ms in") }
 
         var anyMoving = false
         // After an input-side dismissal the labels have already flown; don't rebuild them
@@ -1452,10 +1787,11 @@ final class MissionControlOverlay: NSObject {
                         BarLabel(id: $0.id, center: NSPoint(x: $0.center.x - o.x, y: $0.center.y - o.y),
                                  name: $0.name, icon: $0.icon, contentKey: $0.contentKey,
                                  placeholderWidth: $0.placeholderWidth)
-                    }, now: now, replay: replay, nativeReveal: complete && eventsArmed)
+                    }, now: now, replay: replay, nativeReveal: complete && eventsArmed,
+                       commitAge: commitAge)
                 }
                 if stepSprings {
-                    if w.step(dt: dt) { anyMoving = true }
+                    if w.step(dt: dt, now: now) { anyMoving = true }
                 } else if w.needsMotion {
                     anyMoving = true
                 }
@@ -1505,9 +1841,11 @@ final class MissionControlOverlay: NSObject {
             if statN >= 120 {
                 logLine("frame µs min=\(Int(statMin)) avg=\(Int(statSum / Double(statN))) max=\(Int(statMax))"
                     + " sampleAvg=\(Int(statSampleSum / Double(statN))) applyAvg=\(Int(statApplySum / Double(statN)))"
-                    + " discovers=\(statDiscovers) refreshes=\(statRefreshes) phase=\(phase)")
+                    + " discovers=\(statDiscovers) refreshes=\(statRefreshes)"
+                    + " samples=\(statSamples) rtMax=\(statSampleMaxUs)µs latMax=\(statSampleLatMaxUs)µs phase=\(phase)")
                 statN = 0; statSum = 0; statMin = .infinity; statMax = 0
                 statSampleSum = 0; statApplySum = 0; statDiscovers = 0; statRefreshes = 0
+                statSamples = 0; statSampleMaxUs = 0; statSampleLatMaxUs = 0
             }
             if charMode {
                 logLine("char t=\(now) tiles=\(s.tiles.map { (Int($0.rect.minX), Int($0.rect.width)) })")
@@ -1629,7 +1967,17 @@ final class MissionControlOverlay: NSObject {
                 lastSpacesRefresh = now
                 statRefreshes += 1
                 dbg("tile/space mismatch \(mismatchSig)— re-enumerating spaces")
-                spaces.refresh()
+                // Off-main: the enumeration is a window-server round-trip issued at the
+                // very moment the commit behind the mismatch starts compositing — on main
+                // it blocked the labels for the duration (see `sampleQueue`).
+                spaces.refreshAsync { [weak self] enumerateUs, applyUs in
+                    guard let self, self.phase != .closed else { return }
+                    if self.debugLog, enumerateUs >= 2_000 || applyUs >= 2_000 {
+                        self.dbg("spaces: enumerate \(enumerateUs) µs off-main, apply \(applyUs) µs on main")
+                    }
+                    // Re-map against the new list now, not at the next link tick.
+                    self.frame(now: CACurrentMediaTime(), dt: 0, stepSprings: false, retargetOnly: true)
+                }
             }
         }
         lastMismatchSig = mismatchSig
@@ -1746,6 +2094,8 @@ extension NSScreen {
 /// doesn't participate in the managed-space viewport animation. Best-effort: if the private
 /// symbols are gone or the space can't be made, the caller falls back to hiding for the slide.
 private enum MCLabelStickySpace {
+    /// `spaceID` and `failed` are confined to this queue; `park` is the only entry point.
+    private static let queue = DispatchQueue(label: "mco.sticky", qos: .userInteractive)
     private static var spaceID: UInt64 = 0
     private static var failed = false
 
@@ -1753,8 +2103,20 @@ private enum MCLabelStickySpace {
     /// (an orderOut/orderFront cycle re-attaches the window to the active managed space). If the
     /// private symbols are gone the labels just ride the slide as before — no worse than not
     /// parking.
+    ///
+    /// The CGS calls run OFF the main thread: they are window-server round-trips made at
+    /// the instant the overlay first becomes visible, which is inside Mission Control's
+    /// expand compositing — measured blocking main for 280–480 ms there (2026-09-18, the
+    /// `frame gap` following every `reveal:` line). The window number is read on main;
+    /// everything after it is queue-confined.
     static func park(_ window: NSWindow) {
-        guard !failed, window.windowNumber > 0 else { return }
+        let wid = UInt32(max(0, window.windowNumber))
+        guard wid > 0 else { return }
+        queue.async { attach(wid) }
+    }
+
+    private static func attach(_ wid: UInt32) {
+        guard !failed else { return }
         if spaceID == 0 {
             guard sm_stickySpaceSymbolsAvailable() else {
                 failed = true; HotkeyDiag.log("MC label sticky: symbols missing"); return
@@ -1765,7 +2127,7 @@ private enum MCLabelStickySpace {
             }
             HotkeyDiag.log("MC label sticky space \(spaceID) @level \(CGShieldingWindowLevel())")
         }
-        if !sm_stickySpaceAttachWindow(UInt32(window.windowNumber), spaceID) {
+        if !sm_stickySpaceAttachWindow(wid, spaceID) {
             failed = true; HotkeyDiag.log("MC label sticky: attach symbol missing")
         }
     }
@@ -1814,6 +2176,8 @@ fileprivate struct BarLabel {
 private final class OverlayWindow: NSPanel {
     /// Diagnostics hook: (labelCount, msSinceExpand) at reveal, wired to the engine's dbg log.
     static var onReveal: ((Int, Int) -> Void)?
+    /// Diagnostics hook: (where, alphaReport). Set only while debug logging is on.
+    static var onAlpha: ((String, String) -> Void)?
 
     private let container = NSView()
 
@@ -1829,6 +2193,13 @@ private final class OverlayWindow: NSPanel {
         // target and its opacity ramps 0→1 in step with how far down it has travelled.
         var entering = false
         var launchStartY: CGFloat = 0
+        /// A CASpringAnimation is playing this label's relayout glide in the RENDER server
+        /// (see `caGlide`). The render server draws it; `pos`/`vel` keep running the SAME
+        /// curve on the main thread as a shadow, drawn by nobody, purely so a retarget
+        /// knows how fast the label is already travelling. Without that, every commit in a
+        /// burst restarted the spring from rest and the labels fell behind the tiles —
+        /// which is exactly what "the labels don't make it all the way" looked like.
+        var caDriven = false
         init(field: NSTextField, text: String, center: CGPoint, tau: CGFloat) {
             self.field = field
             self.text = text
@@ -1900,7 +2271,29 @@ private final class OverlayWindow: NSPanel {
     override var canBecomeMain: Bool { false }
 
     /// Whether any label still has distance to cover (drives the engine's settle logic).
-    var needsMotion: Bool { items.values.contains { !$0.settled } }
+    var needsMotion: Bool { items.values.contains { !$0.settled || $0.caDriven } }
+
+    /// Debug: every opacity in the chain that can make the labels render dim — the window,
+    /// the container view and its layer (model vs what the render server is showing), and
+    /// one representative label field. Chasing a "labels never reach full brightness"
+    /// report by eye is hopeless; this says which of them is not 1.
+    var alphaReport: String {
+        func f2(_ v: Double) -> String { String(format: "%.2f", v) }
+        let cl = container.layer
+        var s = "win=\(f2(Double(alphaValue))) cont=\(f2(Double(container.alphaValue)))"
+            + " contLayer=\(f2(Double(cl?.opacity ?? -1)))"
+            + " contPres=\(f2(Double(cl?.presentation()?.opacity ?? -1)))"
+            + " anims=\(cl?.animationKeys()?.joined(separator: ",") ?? "-")"
+        if let it = items.values.first {
+            let l = it.field.layer
+            s += " | field=\(f2(Double(it.field.alphaValue)))"
+                + " fLayer=\(f2(Double(l?.opacity ?? -1)))"
+                + " fPres=\(f2(Double(l?.presentation()?.opacity ?? -1)))"
+                + " fAnims=\(l?.animationKeys()?.joined(separator: ",") ?? "-")"
+                + " hidden=\(it.field.isHidden)"
+        }
+        return s + " items=\(items.count) revealed=\(revealed)"
+    }
 
     /// Whether the reveal has already fired. The engine keeps re-mapping while a visible
     /// overlay is unrevealed, so the fallback reveal gate still gets the repeated updates
@@ -1923,7 +2316,7 @@ private final class OverlayWindow: NSPanel {
     /// marks targets that came from an 806/807 relayout commit — those launch the
     /// native-matched replay spring rather than the fallback pursuit/layout ones.
     func update(labels: [BarLabel]?, now: CFTimeInterval, replay: Bool = false,
-                nativeReveal: Bool = false) {
+                nativeReveal: Bool = false, commitAge: CFTimeInterval = 0) {
         guard let labels, !labels.isEmpty else {
             guard expandedSince != nil || !items.isEmpty else { emptySince = nil; return }
             // Grace period: every tile vanishing at once is how MC dismissal BEGINS (the
@@ -1958,12 +2351,19 @@ private final class OverlayWindow: NSPanel {
                 it.target = l.center
                 if (replay && d > 0.5) || d >= layoutJump {
                     // The tile itself starts gliding here on the native spring right
-                    // about now — play the same curve. Velocity carries over so a
-                    // commit landing mid-flight retargets without a hitch.
-                    it.tau = tauReplay
+                    // about now — play the same curve, in the render server so a blocked
+                    // main thread can't stall it (see caGlide). Retargeting mid-flight is
+                    // safe: the replacement starts from the presentation position.
+                    caGlide(it, to: l.center, commitAge: commitAge)
+                } else if d > 0.01 {
+                    // Something moved this label that isn't a relayout commit — a reorder
+                    // drag, a re-centre the sampler found on its own. That is continuous
+                    // pursuit, which the render server can't play open-loop: take the
+                    // glide back and chase on the main thread.
+                    landCA(it)
+                    it.settled = false
                 }
-                if d > 0.01 { it.settled = false }
-                if it.text != l.contentKey { retext(it, l) }
+                if it.text != l.contentKey { landCA(it); retext(it, l) }
             } else {
                 changedSet = true
                 addItem(l)
@@ -2006,6 +2406,7 @@ private final class OverlayWindow: NSPanel {
     /// arriving after them.
     private func revealInPlace() {
         for it in items.values {
+            cancelCA(it)
             it.pos = it.target
             it.vel = .zero
             it.settled = true
@@ -2020,6 +2421,15 @@ private final class OverlayWindow: NSPanel {
             ctx.timingFunction = Self.fadeInCurve
             container.animator().alphaValue = 1
         }
+        if let report = Self.onAlpha {
+            report("revealInPlace +0", alphaReport)
+            for delay in [0.05, 0.2, 0.5, 1.5] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self else { return }
+                    report("revealInPlace +\(Int(delay * 1000))", self.alphaReport)
+                }
+            }
+        }
     }
 
     /// Seed the drop-in entrance for every currently-shown label AT REVEAL, so the descent
@@ -2028,6 +2438,7 @@ private final class OverlayWindow: NSPanel {
     private func beginEntrance() {
         let top = container.bounds.height
         for it in items.values {
+            cancelCA(it)
             it.launchStartY = it.target.y + (top - it.target.y) * launchStartFraction
             it.pos = CGPoint(x: it.target.x, y: it.launchStartY)
             it.vel = .zero
@@ -2037,6 +2448,112 @@ private final class OverlayWindow: NSPanel {
             it.field.alphaValue = 0
             place(it, aligned: false)
         }
+    }
+
+    /// Key under which the relayout glide is attached to a label's layer.
+    private static let caKey = "mcoGlide"
+
+    /// MCO_NO_CA=1 falls back to stepping every glide on the main thread (the behaviour
+    /// before this change) — the A/B switch, and the instant revert if the render-server
+    /// path ever misbehaves.
+    private static let useCA = ProcessInfo.processInfo.environment["MCO_NO_CA"] == nil
+
+    /// Hand one label's relayout glide to the render server.
+    ///
+    /// WHY: the tiles' own motion is played by WindowManager's Core Animation, and the
+    /// window server is saturated compositing it. Our main thread's CoreAnimation commit
+    /// has to queue behind that work — measured 2026-09-18 at up to 719 ms, with one
+    /// sample round-trip of 13 ms taking 684 ms to be delivered to main. A glide stepped
+    /// on the main thread simply stops for that long while the tiles keep moving, which
+    /// is the whole of the remaining add/remove lag. A CASpringAnimation is evaluated by
+    /// the render server every refresh once committed, so it rides out a blocked main
+    /// thread — and `commitAge` enters the curve at the phase the tiles have already
+    /// reached, so a late commit lands in step rather than restarting the motion.
+    ///
+    /// The animation is NON-ADDITIVE and always replaces any predecessor from its
+    /// on-screen (presentation) position: an additive stack composes the old offset with
+    /// the new one, which is what made sweeping the pointer along the bar throw the
+    /// captions around in an earlier attempt at this.
+    private func caGlide(_ it: Item, to target: CGPoint, commitAge: CFTimeInterval) {
+        guard Self.useCA, let layer = it.field.layer else { it.tau = tauReplay; return }
+        // Where the label actually IS right now — mid-flight if a glide is already playing.
+        // Presentation is the truth on screen; the shadow spring supplies the velocity,
+        // which presentation cannot give without sampling it twice.
+        let from = layer.presentation()?.position ?? layer.position
+        let v = it.caDriven || !it.settled ? it.vel : .zero
+        layer.removeAnimation(forKey: Self.caKey)
+        // An interrupted entrance must not be left half-faded (its alpha is driven by the
+        // main-thread spring's vertical progress, which is about to stop running).
+        if it.entering { it.entering = false; it.field.alphaValue = 1 }
+        // Re-anchor the shadow to what is actually on screen, keeping its velocity.
+        it.pos = from
+        it.vel = v
+        it.tau = tauReplay
+        it.target = target
+        it.settled = false
+        // Model value = the final position. Set the frame from the TARGET, not from the
+        // shadow, then read the layer back for the animation's destination.
+        let size = it.field.frame.size
+        let rect = NSRect(x: target.x - size.width / 2, y: target.y - size.height / 2,
+                          width: size.width, height: size.height)
+        it.field.setFrameOrigin(container.backingAlignedRect(rect, options: .alignAllEdgesNearest).origin)
+        let to = layer.position
+        let a = CASpringAnimation(keyPath: "position")
+        // The measured native relayout curve — re-confirmed 2026-09-18 against the user's
+        // 120 fps capture by tracking the last tile's edge through a remove: 20% complete
+        // at 42 ms, 53% at 108 ms, 86% at 200 ms, 99% at 420 ms, which is this spring to
+        // within the measurement's own precision.
+        a.mass = 1; a.stiffness = 278; a.damping = 33.3
+        // Carry the momentum across the retarget. initialVelocity is expressed as a
+        // fraction of the remaining distance covered per second, along the travel
+        // direction, so project the shadow's velocity onto it.
+        let dx = to.x - from.x, dy = to.y - from.y
+        let dist = (dx * dx + dy * dy).squareRoot()
+        if dist > 0.5 {
+            a.initialVelocity = (v.x * dx + v.y * dy) / dist / dist
+        }
+        a.fromValue = NSValue(point: from)
+        a.toValue = NSValue(point: to)
+        a.duration = a.settlingDuration
+        a.isRemovedOnCompletion = true
+        a.fillMode = .backwards
+        a.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) - commitAge
+        layer.add(a, forKey: Self.caKey)
+        it.caDriven = true
+        // Fast-forward the shadow by the same head start, so it stays in step with what
+        // the render server is drawing.
+        if commitAge > 0 {
+            let sx = Self.springStep(pos: it.pos.x, vel: it.vel.x, target: target.x,
+                                     tau: it.tau, dt: commitAge)
+            let sy = Self.springStep(pos: it.pos.y, vel: it.vel.y, target: target.y,
+                                     tau: it.tau, dt: commitAge)
+            it.pos = CGPoint(x: sx.pos, y: sy.pos)
+            it.vel = CGPoint(x: sx.vel, y: sy.vel)
+        }
+    }
+
+    /// Take a render-server glide back onto the main-thread spring, seeded from where the
+    /// label is ON SCREEN. Used when something the render server can't know about starts
+    /// moving the label — a reorder drag, a content change, a teardown.
+    private func landCA(_ it: Item) {
+        guard it.caDriven else { return }
+        it.caDriven = false
+        guard let layer = it.field.layer else { return }
+        let p = layer.presentation()?.position ?? layer.position
+        layer.removeAnimation(forKey: Self.caKey)
+        it.pos = p
+        // Velocity is deliberately KEPT: the shadow has been tracking the same curve, so
+        // handing back to the main-thread spring mid-flight continues the motion instead
+        // of stalling it.
+        it.settled = false
+        if it.entering { it.entering = false; it.field.alphaValue = 1 }
+        place(it, aligned: false)
+    }
+
+    /// Drop a glide without adopting its position (teardown paths).
+    private func cancelCA(_ it: Item) {
+        it.caDriven = false
+        it.field.layer?.removeAnimation(forKey: Self.caKey)
     }
 
     /// Exact critically damped spring step for one axis:  x'' = ω²(target−x) − 2ωx'.
@@ -2051,10 +2568,36 @@ private final class OverlayWindow: NSPanel {
     }
 
     /// Advance all springs by `dt`. Returns true while anything is still moving.
-    func step(dt: CFTimeInterval) -> Bool {
+    func step(dt: CFTimeInterval, now: CFTimeInterval = CACurrentMediaTime()) -> Bool {
         guard dt > 0 else { return needsMotion }
         var moving = false
         for it in items.values where !it.settled {
+            if it.caDriven {
+                // Advance the SHADOW only — the render server is drawing this label, and
+                // touching its frame here would fight the animation. Stepping the same
+                // closed-form spring keeps pos/vel truthful for the next retarget, and
+                // retires the glide when the curve has run out.
+                let sx = Self.springStep(pos: it.pos.x, vel: it.vel.x, target: it.target.x,
+                                         tau: it.tau, dt: dt)
+                let sy = Self.springStep(pos: it.pos.y, vel: it.vel.y, target: it.target.y,
+                                         tau: it.tau, dt: dt)
+                it.pos = CGPoint(x: sx.pos, y: sy.pos)
+                it.vel = CGPoint(x: sx.vel, y: sy.vel)
+                let rx = it.pos.x - it.target.x, ry = it.pos.y - it.target.y
+                if (rx * rx + ry * ry).squareRoot() < 0.05,
+                   (it.vel.x * it.vel.x + it.vel.y * it.vel.y).squareRoot() < 0.5 {
+                    it.caDriven = false
+                    it.field.layer?.removeAnimation(forKey: Self.caKey)
+                    it.pos = it.target
+                    it.vel = .zero
+                    it.settled = true
+                    it.tau = tauPursuit
+                    place(it, aligned: true)
+                } else {
+                    moving = true
+                }
+                continue
+            }
             let sx = Self.springStep(pos: it.pos.x, vel: it.vel.x, target: it.target.x, tau: it.tau, dt: dt)
             let sy = Self.springStep(pos: it.pos.y, vel: it.vel.y, target: it.target.y, tau: it.tau, dt: dt)
             it.pos.x = sx.pos; it.vel.x = sx.vel
@@ -2085,6 +2628,7 @@ private final class OverlayWindow: NSPanel {
 
     /// Immediate teardown (engine disabled) — no fades.
     func clearImmediately() {
+        for it in items.values { cancelCA(it) }
         fadeGen += 1
         container.subviews.forEach { $0.removeFromSuperview() }
         items.removeAll()
@@ -2122,6 +2666,7 @@ private final class OverlayWindow: NSPanel {
     }
 
     private func removeItem(_ it: Item) {
+        cancelCA(it)
         let field = it.field
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.15

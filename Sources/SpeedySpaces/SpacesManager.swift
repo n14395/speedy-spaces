@@ -10,6 +10,11 @@ final class SpacesManager {
     private(set) var spaces: [Space] = []
     /// The list exactly as enumerated from the window server — what verification judges.
     private var rawSpaces: [Space] = []
+    private let refreshQueue = DispatchQueue(label: "spaces.refresh", qos: .userInteractive)
+    private var refreshInFlight = false
+    private var refreshAgain = false
+    /// Bumped by every synchronous refresh so an older async enumeration can't overwrite it.
+    private var refreshGen = 0
     /// Optimistic UI: the space we just asked an engine to switch to. The window server
     /// doesn't report the new space as current until the transition animation lands, so the
     /// menubar would otherwise lag the click by the whole animation. While set, `spaces`
@@ -122,7 +127,45 @@ final class SpacesManager {
 
     /// Re-query the window server and rebuild the space list.
     func refresh() {
-        rawSpaces = Self.enumerateSpaces()
+        refreshGen += 1
+        apply(raw: Self.enumerateSpaces())
+    }
+
+    /// `refresh()` with the window-server enumeration off the main thread. The
+    /// enumeration is a synchronous round-trip that blocks for as long as WindowManager
+    /// takes to composite — and the Mission Control overlay asks for it at the exact
+    /// moment a relayout commit begins compositing (a tile/space count mismatch is how it
+    /// learns of an add or remove), which froze every label for the duration. One
+    /// enumeration in flight at a time; a request mid-flight queues one more (that
+    /// caller's completion is dropped). A synchronous `refresh()` in the meantime wins:
+    /// an enumeration older than the latest applied one is discarded. `completion`
+    /// (main thread) reports the enumeration and apply costs in microseconds.
+    func refreshAsync(completion: ((_ enumerateUs: Int, _ applyUs: Int) -> Void)? = nil) {
+        if refreshInFlight { refreshAgain = true; return }
+        refreshInFlight = true
+        let gen = refreshGen
+        refreshQueue.async { [weak self] in
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let raw = Self.enumerateSpaces()
+            let enumerateUs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1_000_000)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.refreshInFlight = false
+                var applyUs = 0
+                if gen == self.refreshGen {
+                    let t1 = CFAbsoluteTimeGetCurrent()
+                    self.apply(raw: raw)
+                    applyUs = Int((CFAbsoluteTimeGetCurrent() - t1) * 1_000_000)
+                }
+                completion?(enumerateUs, applyUs)
+                if self.refreshAgain { self.refreshAgain = false; self.refreshAsync() }
+            }
+        }
+    }
+
+    /// The model-update half of `refresh()`. Main thread.
+    private func apply(raw: [Space]) {
+        rawSpaces = raw
         if let p = predicted,
            Date() >= p.expires || rawSpaces.first(where: { $0.uuid == p.uuid })?.isCurrent == true {
             predicted = nil   // reality caught up (or the prediction went stale)
@@ -323,7 +366,8 @@ final class SpacesManager {
     var hasPendingPrediction: Bool { predicted != nil }
 
     @discardableResult
-    func switchTo(_ target: Space, dismissedShowDesktop: Bool = false) -> Bool {
+    func switchTo(_ target: Space, dismissedShowDesktop: Bool = false,
+                  allowFallback: Bool = true) -> Bool {
         // macOS "Show Desktop" (clicked wallpaper / F11 / hot corner) silently swallows every space
         // switch until it's dismissed — the switch just times out. Detect it (WindowManager's
         // full-screen layer-18 overlay, present even on an empty desktop), send the Dock's dismiss,
@@ -345,14 +389,46 @@ final class SpacesManager {
                 // before the WindowServer settles, and a switch fired mid-animation is still
                 // swallowed (verified: the switch times out). This beat is what makes it land.
                 usleep(500_000)
-                DispatchQueue.main.async { self?.switchTo(target, dismissedShowDesktop: true) }
+                DispatchQueue.main.async {
+                    self?.switchTo(target, dismissedShowDesktop: true, allowFallback: allowFallback)
+                }
             }
             return true
         }
-        guard let engine = engines[Prefs.switchMethod] else {
-            let reason = "no engine registered for \(Prefs.switchMethod.rawValue)"
+        return dispatch(target, method: Prefs.switchMethod, allowFallback: allowFallback)
+    }
+
+    /// Engine tried when the user's chosen one fires but the space never changes: the other
+    /// one. The two fail for unrelated reasons, which is what makes each a real safety net
+    /// for the other rather than a second roll of the same dice.
+    ///
+    /// `gesture` → `missionControl`: the macOS 27 beta silently drops this app's synthetic
+    /// dock-swipes (it appears to accept them only while real dock-swipe history is fresh; a
+    /// real 3-finger swipe heals it). That takes out chords AND gestures together, since both
+    /// funnel through the one gesture engine, while Mission Control — which presses the
+    /// target's button in the Dock's AX tree rather than posting HID events — keeps working.
+    ///
+    /// `missionControl` → `gesture`: Mission Control depends on the Dock publishing the
+    /// undocumented `mc.*` AX identifiers, which it need not keep doing (MissionControlSwitcher
+    /// says as much); posting events doesn't care about the AX tree.
+    ///
+    /// Exhaustive on purpose — a third engine has to make this decision explicitly.
+    private static func fallbackMethod(after method: SwitchMethod) -> SwitchMethod {
+        switch method {
+        case .gesture:        return .missionControl
+        case .missionControl: return .gesture
+        }
+    }
+
+    /// One switch attempt through `method`. `allowFallback` is false for the fallback
+    /// attempt itself (so a failure can never loop) and for `--probe-switch`, which has to
+    /// report on the engine it was asked to test rather than on a silent substitute.
+    @discardableResult
+    private func dispatch(_ target: Space, method: SwitchMethod, allowFallback: Bool) -> Bool {
+        guard let engine = engines[method] else {
+            let reason = "no engine registered for \(method.rawValue)"
             NSLog("[SpeedySpaces] \(reason)")
-            publish(SwitchOutcome(method: Prefs.switchMethod, fromOrdinal: nil,
+            publish(SwitchOutcome(method: method, fromOrdinal: nil,
                                   toOrdinal: target.ordinalOnDisplay, displayIndex: target.displayIndex,
                                   ok: false, milliseconds: 0, reason: reason))
             return false
@@ -406,9 +482,44 @@ final class SpacesManager {
             verifier.verify(method: engine.method, target: target, from: ctx.current, start: start,
                             refresh: { [weak self] in self?.refresh() },
                             isCurrentTarget: { [weak self] in self?.rawSpaces.first { $0.uuid == target.uuid }?.isCurrent ?? false },
-                            completion: { [weak self] outcome in self?.publish(outcome) })
+                            completion: { [weak self] outcome in
+                                guard let self else { return }
+                                // A verified failure means the engine's events were posted and
+                                // the space still didn't change. Retry through the fallback
+                                // before reporting anything, so the user gets a slower switch
+                                // rather than a dead one.
+                                if !outcome.ok, allowFallback,
+                                   self.beginFallback(after: outcome, target: target,
+                                                      from: ctx.current) { return }
+                                self.publish(outcome)
+                            })
             return true
         }
+    }
+
+    /// Start a fallback attempt for a failed switch. Returns true if one was started, in
+    /// which case the caller must NOT publish `outcome` — the fallback publishes the verdict
+    /// that actually matters. The original failure is still logged, so the diagnostic trail
+    /// for the underlying dropped-dock-swipe bug survives even when the retry rescues it.
+    private func beginFallback(after outcome: SwitchOutcome, target: Space, from: Space?) -> Bool {
+        let method = Self.fallbackMethod(after: outcome.method)
+        guard let engine = engines[method] else { return false }
+        // Re-read live state in the same call that acts. Two things can happen during the 2 s
+        // timeout that make retrying wrong: the user reached the target by hand (nothing left
+        // to do), or they moved somewhere else entirely (they're driving — don't yank them
+        // back). Require that NOTHING moved, which is both the safe condition and the exact
+        // signature of the bug being rescued: the dropped dock-swipe leaves the space
+        // untouched. A partial multi-hop switch that stalls midway is deliberately not
+        // retried, since re-firing from an unknown intermediate space is riskier than
+        // reporting the failure.
+        refresh()
+        guard rawSpaces.first(where: { $0.uuid == target.uuid })?.isCurrent == false else { return false }
+        if let from, rawSpaces.first(where: { $0.uuid == from.uuid })?.isCurrent != true { return false }
+        guard case .available = engine.availability(for: target, context(for: target)) else { return false }
+        NSLog("[SpeedySpaces] switch \(outcome.summary) — retrying via \(method.rawValue)")
+        HotkeyDiag.log("switch \(outcome.summary) · retrying via \(method.rawValue)")
+        _ = dispatch(target, method: method, allowFallback: false)
+        return true
     }
 
     /// Relocate a managed space to `index` on display `displayID` via the window server's
@@ -475,7 +586,10 @@ final class SpacesManager {
                 done.signal()
             }
         }
-        _ = switchTo(target)
+        // No fallback: a probe must report on the engine it was asked to test, not on a
+        // silent substitute — otherwise `--probe-switch gesture` passes while the gesture
+        // engine is exactly what's broken.
+        _ = switchTo(target, allowFallback: false)
         // Spin the runloop up to ~3s for the async verifier.
         let deadline = Date().addingTimeInterval(3.0)
         while done.wait(timeout: .now()) == .timedOut && Date() < deadline {
