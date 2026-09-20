@@ -42,8 +42,26 @@ final class MenuBarStripView: NSView {
         let side = min(max(raw, 12), 22)
         return (side, M.squareCorner * side / M.square, M.numberFont * side / M.square)
     }
-    private var numberM: (side: CGFloat, corner: CGFloat, font: CGFloat) {
-        Self.numberMetrics(side: Prefs.menuBarSwitcherSquareSize)
+    /// Square metrics for one piece. The CURRENT workspace follows the main size pref; the
+    /// others follow the inactive-size pref, which tracks the main one until that second
+    /// slider is moved — so the two sliders are independent but the strip starts out uniform.
+    private func metrics(current: Bool) -> (side: CGFloat, corner: CGFloat, font: CGFloat) {
+        Self.numberMetrics(side: current ? Prefs.menuBarSwitcherSquareSize
+                                         : Prefs.menuBarInactiveSquareSize)
+    }
+    /// The current workspace's metrics — also what the icon+name segment, the grid fallback
+    /// and the strip's font scaling follow, since all three only ever draw the current space.
+    private var numberM: (side: CGFloat, corner: CGFloat, font: CGFloat) { metrics(current: true) }
+
+    /// The point size icons for the strip must be rendered at. Every glyph box in the strip is
+    /// its piece's square side (== `iconSide` for the current one, since `M.iconSide ==
+    /// M.square`), and `drawIcon` never upscales — so an icon rendered smaller than the
+    /// LARGEST box it could land in is permanently capped below the size the user asked for.
+    /// Callers that build the strip's icons (see `StatusItemController`) must use this, not a
+    /// fixed 15; one image serves both sizes, and the smaller box just scales it down.
+    static var iconPointSize: CGFloat {
+        max(numberMetrics(side: Prefs.menuBarSwitcherSquareSize).side,
+            numberMetrics(side: Prefs.menuBarInactiveSquareSize).side)
     }
 
     /// Fallback image for icon tiles whose space has no custom icon (icons style only).
@@ -51,15 +69,18 @@ final class MenuBarStripView: NSView {
     private var defaultIconImage: NSImage?
 
     /// Placeholder for the current-space segment when the settings say icon-only but
-    /// the space has no icon — without it the segment would render empty.
-    static let placeholderIcon: NSImage? = {
-        guard let img = NSImage(systemSymbolName: "rectangle.stack.fill",
-                                accessibilityDescription: "Workspace") else { return nil }
-        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+    /// the space has no icon — without it the segment would render empty. Rendered at the
+    /// strip's own point size so it scales with the size pref like every other icon.
+    static var placeholderIcon: NSImage? { symbol("rectangle.stack.fill", label: "Workspace") }
+
+    /// An SF Symbol rendered as a template at the strip's point size (`iconPointSize`).
+    private static func symbol(_ name: String, label: String? = nil) -> NSImage? {
+        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: label) else { return nil }
+        let config = NSImage.SymbolConfiguration(pointSize: iconPointSize, weight: .regular)
         let configured = img.withSymbolConfiguration(config) ?? img
         configured.isTemplate = true
         return configured
-    }()
+    }
 
 
     /// Glyph colour on the active square's labelColor fill: the appearance's opposite
@@ -85,6 +106,16 @@ final class MenuBarStripView: NSView {
         Self.pieceLook(current: current, background: Prefs.menuBarSwitcherGreyBackground,
                        inverted: Prefs.menuBarSwitcherInvertColours)
     }
+    /// The glyph box inside an icon tile's `square`. A tile with no fill IS just the glyph, so
+    /// it gets the whole square — which is exactly the box the current space's icon segment
+    /// draws into (`iconSide` == the square side) and so keeps focused and unfocused icons the
+    /// SAME size. A filled tile insets the glyph by the 2 pt the current segment's pill also
+    /// leaves around its icon (`iconSide + 4`), so the glyph sits inside the square rather than
+    /// touching its rounded edges. Pure — verified in `selfChecks`.
+    static func tileGlyphRect(_ square: NSRect, filled: Bool) -> NSRect {
+        filled ? square.insetBy(dx: 2, dy: 2) : square
+    }
+
     private func fill(for look: PieceLook) -> NSColor? {
         switch look {
         case .flipped: return .labelColor
@@ -174,7 +205,7 @@ final class MenuBarStripView: NSView {
         hideTooltip()   // pieces are about to change; drop any showing tooltip + its stale index.
         let iconsStyle = Prefs.workspaceListStyle == .icons
         defaultIconImage = iconsStyle
-            ? IconRendering.image(for: Prefs.workspaceListDefaultIcon, pointSize: 15) : nil
+            ? IconRendering.image(for: Prefs.workspaceListDefaultIcon, pointSize: Self.iconPointSize) : nil
         let currents = displaySpaces.filter { currentUUIDs.contains($0.uuid) }
         var built: [Piece] = []
 
@@ -255,7 +286,8 @@ final class MenuBarStripView: NSView {
 
     private func width(for kind: Piece.Kind) -> CGFloat {
         switch kind {
-        case .number, .iconTile: return numberM.side + iconMargin * 2
+        case let .number(_, current):      return metrics(current: current).side + iconMargin * 2
+        case let .iconTile(_, current):    return metrics(current: current).side + iconMargin * 2
         case .grid:   return iconSide + hPad * 2
         case let .iconName(icon, name):
             var w: CGFloat = 0
@@ -278,9 +310,10 @@ final class MenuBarStripView: NSView {
     private var hPad: CGFloat { M.hPad + iconMargin }
     private var edgePad: CGFloat { Prefs.menuBarEdgePadding }
 
-    private var numberFontObj: NSFont { .systemFont(ofSize: numberM.font, weight: .medium) }
-    /// The size pref scales the WHOLE item, not just the squares: the current-space icon,
-    /// name font, and grid fallback all follow the 15 pt baseline proportionally.
+    private func numberFontObj(_ size: CGFloat) -> NSFont { .systemFont(ofSize: size, weight: .medium) }
+    /// The current workspace's size pref scales its WHOLE segment, not just its square: its
+    /// icon, the name font, and the grid fallback all follow the 15 pt baseline
+    /// proportionally. The other workspaces' squares scale from their own pref instead.
     private var stripScale: CGFloat { numberM.side / M.square }
     private var iconSide: CGFloat { M.iconSide * stripScale }
     private var nameFontObj: NSFont { .systemFont(ofSize: M.nameFont * stripScale, weight: .regular) }
@@ -301,7 +334,7 @@ final class MenuBarStripView: NSView {
         for p in pieces {
             switch p.kind {
             case let .number(n, current):
-                let m = numberM
+                let m = metrics(current: current)
                 let rect = NSRect(x: p.x + (p.width - m.side) / 2, y: midY - m.side / 2,
                                   width: m.side, height: m.side)
                 let lk = look(current: current)
@@ -309,20 +342,20 @@ final class MenuBarStripView: NSView {
                     let path = NSBezierPath(roundedRect: rect, xRadius: m.corner, yRadius: m.corner)
                     fillColor.setFill(); path.fill()
                 }
-                drawNumber(n, in: rect, color: glyph(for: lk), knockout: lk == .flipped)
+                drawNumber(n, in: rect, font: numberFontObj(m.font),
+                           color: glyph(for: lk), knockout: lk == .flipped)
             case let .iconTile(icon, current):
-                let m = numberM
+                let m = metrics(current: current)
                 let rect = NSRect(x: p.x + (p.width - m.side) / 2, y: midY - m.side / 2,
                                   width: m.side, height: m.side)
                 let lk = look(current: current)
-                if let fillColor = fill(for: lk) {
+                let fillColor = fill(for: lk)
+                if let fillColor {
                     let path = NSBezierPath(roundedRect: rect, xRadius: m.corner, yRadius: m.corner)
                     fillColor.setFill(); path.fill()
                 }
                 if let img = icon ?? defaultIconImage {
-                    // The inset keeps the glyph proportioned like the digits, and means a
-                    // 15 pt render is never upscaled (inner side ≤ 15.4 across 12–22 pt).
-                    let inner = rect.insetBy(dx: m.side * 0.15, dy: m.side * 0.15)
+                    let inner = Self.tileGlyphRect(rect, filled: fillColor != nil)
                     // Flipped look: punch the glyph out of the fill so the treatment survives
                     // templating. An emoji is a colour image — knocking it out would discard its
                     // colours, so it keeps the inverted tint and draws on top as before.
@@ -377,7 +410,7 @@ final class MenuBarStripView: NSView {
                     if knockout { NSGraphicsContext.restoreGraphicsState() }
                 }
             case .grid:
-                if let img = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: nil) {
+                if let img = Self.symbol("square.grid.2x2") {
                     drawIcon(img, in: NSRect(x: p.x + hPad, y: midY - iconSide / 2, width: iconSide, height: iconSide))
                 }
             }
@@ -412,9 +445,10 @@ final class MenuBarStripView: NSView {
     /// That is what makes the flipped (current-space) look survive templating: the filled
     /// square is the only opaque part, and the digit is a hole in it, so AppKit's tint paints
     /// the square and the bar shows through the digit.
-    private func drawNumber(_ n: Int, in rect: NSRect, color: NSColor, knockout: Bool = false) {
+    private func drawNumber(_ n: Int, in rect: NSRect, font: NSFont,
+                            color: NSColor, knockout: Bool = false) {
         let s = "\(n)" as NSString
-        let attrs: [NSAttributedString.Key: Any] = [.font: numberFontObj, .foregroundColor: color]
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         let sz = s.size(withAttributes: attrs)
         let at = NSPoint(x: rect.midX - sz.width / 2, y: rect.midY - sz.height / 2)
         guard knockout else { return s.draw(at: at, withAttributes: attrs) }
@@ -618,6 +652,21 @@ final class MenuBarStripView: NSView {
         check(pieceLook(current: false, background: false, inverted: true)  == .plain,   "look: no bg, other -> plain")
 
         check(placeholderIcon?.isTemplate == true, "placeholder: rectangle.stack.fill resolves as template")
+
+        // An unfocused icon tile must draw its glyph in the same box the current space's icon
+        // gets, or the strip shows two icon sizes side by side. With no fill that box is the
+        // whole square (== iconSide); a fill insets it by the pill's 2 pt.
+        let sq = NSRect(x: 7, y: 0, width: 22, height: 22)
+        check(tileGlyphRect(sq, filled: false) == sq, "tile: unfilled glyph box fills the square")
+        check(tileGlyphRect(sq, filled: true) == sq.insetBy(dx: 2, dy: 2),
+              "tile: filled glyph box insets by the pill's 2 pt")
+        check(M.iconSide == M.square,
+              "tile: icon box and square share a baseline (unfilled tile == current icon size)")
+
+        // The two size prefs are independent, and both land inside the supported range —
+        // so the shipped defaults (22 current / 18 other) survive `numberMetrics`' clamp.
+        check(numberMetrics(side: 22).side == 22 && numberMetrics(side: 18).side == 18,
+              "size: shipped defaults (22 current / 18 other) pass through unclamped")
 
         let base = numberMetrics(side: 15)
         check(base == (15, 3.5, 10.5),      "metrics: 15 pt reproduces the baseline look")

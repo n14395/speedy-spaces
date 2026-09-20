@@ -88,7 +88,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             title: { [weak self] in self?.title(for: $0) ?? "" },
             icon: { [weak self] space in
                 guard let self else { return nil }
-                return IconRendering.image(for: self.store.metadata(for: space.uuid), pointSize: 15)
+                // Render at the strip's own point size: every glyph box scales with the size
+                // pref but `drawIcon` never upscales, so a fixed 15 pt render capped the icons
+                // below the size the pref asked for.
+                return IconRendering.image(for: self.store.metadata(for: space.uuid),
+                                           pointSize: MenuBarStripView.iconPointSize)
             }
         )
         statusItem.length = strip.intrinsicContentSize.width

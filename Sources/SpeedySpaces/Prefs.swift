@@ -217,7 +217,7 @@ enum Prefs {
 
     static var switcherPosition: SwitcherPosition {
         get { SwitcherPosition(rawValue: defaults.string(forKey: "switcherPosition") ?? "")
-                ?? .mimicMissionControl }
+                ?? .classicPopover }
         set {
             defaults.set(newValue.rawValue, forKey: "switcherPosition")
             NotificationCenter.default.post(name: .speedySpacesPrefsChanged, object: nil)
@@ -267,12 +267,13 @@ enum Prefs {
         }
     }
 
-    /// Size (pt) of the menu bar item's contents (default 15, clamped 12–22). The whole
-    /// strip scales with it — squares, current-space icon and name, and the grid
-    /// fallback; see MenuBarStripView.numberMetrics/stripScale.
+    /// Size (pt) of the CURRENT workspace's menu bar contents (default 22, clamped 12–22):
+    /// its square/icon tile, its icon + name segment and its name font, plus the grid
+    /// fallback; see MenuBarStripView.numberMetrics/stripScale. The other workspaces'
+    /// squares follow `menuBarInactiveSquareSize`.
     static var menuBarSwitcherSquareSize: CGFloat {
         get {
-            let raw = defaults.object(forKey: "menuBarSwitcherSquareSize") as? Double ?? 15
+            let raw = defaults.object(forKey: "menuBarSwitcherSquareSize") as? Double ?? 22
             return CGFloat(min(max(raw, 12), 22))
         }
         set {
@@ -281,14 +282,28 @@ enum Prefs {
         }
     }
 
+    /// Size (pt) of the NON-current workspaces' squares / icon tiles in the menu bar
+    /// (default 18, clamped 12–22) — a notch below the current workspace's 22, so the
+    /// focused space reads as the larger one without the others being hard to hit.
+    static var menuBarInactiveSquareSize: CGFloat {
+        get {
+            let raw = defaults.object(forKey: "menuBarInactiveSquareSize") as? Double ?? 18
+            return CGFloat(min(max(raw, 12), 22))
+        }
+        set {
+            defaults.set(Double(newValue), forKey: "menuBarInactiveSquareSize")
+            NotificationCenter.default.post(name: .speedySpacesPrefsChanged, object: nil)
+        }
+    }
+
     /// Horizontal spacing (pt) added around every menu bar icon — the workspace
     /// squares/tiles, the current-space icon/name segment, and the grid fallback — on top
-    /// of their built-in padding (default 10, clamped 0–16). The margin lands on both sides
+    /// of their built-in padding (default 4, clamped 0–16). The margin lands on both sides
     /// of each icon, so with the inter-segment gap fixed at 0 it is what separates adjacent
     /// icons; higher values give every icon more breathing room.
     static var menuBarSpacing: CGFloat {
         get {
-            let raw = defaults.object(forKey: "menuBarSpacing") as? Double ?? 3
+            let raw = defaults.object(forKey: "menuBarSpacing") as? Double ?? 4
             return CGFloat(min(max(raw, 0), 16))
         }
         set {

@@ -312,8 +312,13 @@ if let reorderArgIdx = CommandLine.arguments.firstIndex(of: "--probe-space-reord
         guard src.spaces.filter({ $0.type == 0 }).count >= 3, dst.spaces.filter({ $0.type == 0 }).count >= 2 else {
             print("SKIP cross: need ≥3 desktops on source and ≥2 on destination"); return false
         }
-        guard let (idx, sp) = src.spaces.enumerated().last(where: { $0.element.type == 0 && $0.element.uuid != src.currentUUID }),
+        // lastIndex(where:) rather than enumerated().last(where:): EnumeratedSequence only
+        // conforms to BidirectionalCollection on macOS 26+, and the deployment target is
+        // 14.0 (it is an error outright in the Swift 6 language mode). `spaces` is an
+        // Array, so the index IS the offset and this is an exact equivalent.
+        guard let idx = src.spaces.lastIndex(where: { $0.type == 0 && $0.uuid != src.currentUUID }),
               idx > 0 else { print("SKIP cross: no safe source desktop"); return false }
+        let sp = src.spaces[idx]
         print("cross: moving \(sp.uuid.prefix(6)) from \(src.ident.prefix(8))[\(idx)] to end of \(dst.ident.prefix(8))")
         let err = move(sp.sid, dst.ident, dst.spaces.count)
         print("CGSMoveManagedSpaceToDisplayIndex(cross) -> CGError \(err)")

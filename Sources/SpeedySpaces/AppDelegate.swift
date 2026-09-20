@@ -87,6 +87,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.terminateOtherInstances()  // newest launch wins — a rebuild's binary replaces a stale one
+        #if SPARKLE
+        SparkleUpdater.start()
+        #endif
         Prefs.seedDefaultShortcutsIfNeeded()   // ship default app-owned chords before the first reload
         // Spaces 11/12 have no macOS-assigned chord; give them ⌃- / ⌃= before the reload so the
         // Move rows can derive ⌃⇧- / ⌃⇧= from them.

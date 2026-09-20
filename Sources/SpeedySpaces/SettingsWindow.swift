@@ -45,6 +45,8 @@ final class SettingsController: NSWindowController {
     private var screenRecordingActiveObserver: NSObjectProtocol?
     private weak var spacingValueLabel: NSTextField?
     private weak var edgeValueLabel: NSTextField?
+    private weak var sizeValueLabel: NSTextField?
+    private weak var inactiveSizeValueLabel: NSTextField?
     private weak var switcherFlashDurationReadout: NSTextField?
     /// Every recorder in the Shortcuts sub-tabs with its action, for switching them
     /// between whole-chord and key-only capture when the global-modifier scheme flips.
@@ -184,11 +186,17 @@ final class SettingsController: NSWindowController {
             + "and also makes macOS's own Move-left/right-a-space shortcuts wrap past the ends "
             + "(requires Accessibility)."
 
-        return makePane(label: "General", symbol: "gearshape", views: [
+        var views: [NSView] = [
             loginToggle, methodRow, animationRow,
             wrapToggle, outcomeLabel, namingNote,
             backupHeader, backupRow, backupNote,
-        ])
+        ]
+        #if SPARKLE
+        let updatesHeader = NSTextField(labelWithString: "Updates")
+        updatesHeader.font = .boldSystemFont(ofSize: 13)
+        views += [updatesHeader, SparkleUpdater.shared.makeButton()]
+        #endif
+        return makePane(label: "General", symbol: "gearshape", views: views)
     }
 
     private func makeMenuBarPane() -> NSTabViewItem {
@@ -260,22 +268,11 @@ final class SettingsController: NSWindowController {
         styleRow.orientation = .horizontal
         styleRow.spacing = 8
 
-        let sizeLabel = NSTextField(labelWithString: "Size:")
-        sizeLabel.font = .systemFont(ofSize: 12)
-        let sizeSlider = NSSlider(value: Double(Prefs.menuBarSwitcherSquareSize),
-                                  minValue: 12, maxValue: 22,
-                                  target: self, action: #selector(changeSwitcherSquareSize(_:)))
-        sizeSlider.isContinuous = true
-        sizeSlider.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        let sizeRow = NSStackView(views: [sizeLabel, sizeSlider])
-        sizeRow.orientation = .horizontal
-        sizeRow.spacing = 8
-
-        // Spacing & padding: fine layout control over the strip. A shared helper keeps the
-        // sliders aligned (fixed-width right-justified captions) and shows the live pt value
-        // in a trailing readout that its action selector keeps in sync.
+        // Sliders: a shared helper keeps them aligned (fixed-width right-justified captions)
+        // and shows the live pt value in a trailing readout that its action selector keeps
+        // in sync. Used by the two size sliders and by Spacing & padding below.
         func metricRow(_ caption: String, value: CGFloat, min: Double, max: Double,
-                       action: Selector) -> (row: NSStackView, valueLabel: NSTextField) {
+                       action: Selector) -> (row: NSStackView, slider: NSSlider, valueLabel: NSTextField) {
             let label = NSTextField(labelWithString: caption)
             label.font = .systemFont(ofSize: 12)
             label.alignment = .right
@@ -292,8 +289,23 @@ final class SettingsController: NSWindowController {
             let row = NSStackView(views: [label, slider, readout])
             row.orientation = .horizontal
             row.spacing = 8
-            return (row, readout)
+            return (row, slider, readout)
         }
+
+        // Two independent size sliders: the current workspace's segment (its square/icon,
+        // name and number) and the other workspaces' squares — 22/18 by default, so the
+        // focused workspace reads as the larger one.
+        let size = metricRow("Current size:", value: Prefs.menuBarSwitcherSquareSize,
+                             min: 12, max: 22, action: #selector(changeSwitcherSquareSize(_:)))
+        self.sizeValueLabel = size.valueLabel
+        size.row.toolTip = "Size of the current workspace's icon, name and number in the menu bar."
+        let sizeRow = size.row
+
+        let otherSize = metricRow("Other sizes:", value: Prefs.menuBarInactiveSquareSize,
+                                  min: 12, max: 22, action: #selector(changeInactiveSquareSize(_:)))
+        self.inactiveSizeValueLabel = otherSize.valueLabel
+        otherSize.row.toolTip = "Size of the OTHER workspaces' squares / icons in the menu bar."
+        let otherSizeRow = otherSize.row
 
         let spacingHeader = NSTextField(labelWithString: "Spacing & padding")
         spacingHeader.font = .boldSystemFont(ofSize: 13)
@@ -346,16 +358,18 @@ final class SettingsController: NSWindowController {
         let mbNote = NSTextField(wrappingLabelWithString:
             "Choose what the menu bar shows. “Show Other Workspaces” adds a clickable square for each "
             + "space on the focused display — left-click a square to switch to it, right-click (or click "
-            + "the current space) for the menu. Size, spacing, and padding apply to the whole menu "
-            + "bar item — spacing adds margin around every icon (separating adjacent ones), and edge "
-            + "padding insets both ends of the item.")
+            + "the current space) for the menu. “Current size” scales the current workspace's icon, "
+            + "name and number; “Other sizes” scales the other workspaces' squares. Spacing and "
+            + "padding apply to the whole menu bar item — spacing adds margin around every icon "
+            + "(separating adjacent ones), and edge padding insets both ends of the item.")
         mbNote.textColor = .secondaryLabelColor
         mbNote.font = .systemFont(ofSize: 11)
         mbNote.preferredMaxLayoutWidth = 510
 
         return makePane(label: "Menu Bar", symbol: "menubar.rectangle", views: [
             displaysHeader, displayToggle, indent(collapseToggle), indent(hideSingleToggle),
-            mbIconToggle, mbNameToggle, mbNumberToggle, mbSwitcherToggle, listBox, sizeRow, backgroundToggle,
+            mbIconToggle, mbNameToggle, mbNumberToggle, mbSwitcherToggle, listBox,
+            sizeRow, otherSizeRow, backgroundToggle,
             invertBox, spacingHeader, marginRow, edgeRow, mbNote,
         ])
     }
@@ -824,7 +838,15 @@ final class SettingsController: NSWindowController {
     }
 
     @objc private func changeSwitcherSquareSize(_ sender: NSSlider) {
-        Prefs.menuBarSwitcherSquareSize = CGFloat(sender.doubleValue)
+        let v = sender.doubleValue.rounded()
+        Prefs.menuBarSwitcherSquareSize = CGFloat(v)
+        sizeValueLabel?.stringValue = "\(Int(v)) pt"
+    }
+
+    @objc private func changeInactiveSquareSize(_ sender: NSSlider) {
+        let v = sender.doubleValue.rounded()
+        Prefs.menuBarInactiveSquareSize = CGFloat(v)
+        inactiveSizeValueLabel?.stringValue = "\(Int(v)) pt"
     }
 
     @objc private func changeSwitcherFlashDuration(_ sender: NSSlider) {
