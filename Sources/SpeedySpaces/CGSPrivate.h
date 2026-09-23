@@ -48,6 +48,10 @@ bool sm_missionControlSymbolsAvailable(void);
 // Space ids containing this window (+1 retained CFArray of CFNumber), or NULL. Used to
 // VERIFY moves — the underlying move calls return void and can silently no-op.
 CFArrayRef sm_copySpaceIDsForWindow(uint32_t wid) CF_RETURNS_RETAINED;
+// Same, with an explicit CGSSpaceMask. 0x7 = managed spaces only; the unmanaged
+// (sticky / transient expose) spaces need bit 3 — mission-control-labels.md found the
+// expose space only under 0x8 — so 0xF sees everything.
+CFArrayRef sm_copySpaceIDsForWindowMask(uint32_t wid, uint32_t mask) CF_RETURNS_RETAINED;
 // Window ID for an AXUIElement of role AXWindow (private _AXUIElementGetWindow).
 bool sm_windowIDForAXElement(AXUIElementRef element, uint32_t *outWID);
 bool sm_axWindowIDSymbolAvailable(void);

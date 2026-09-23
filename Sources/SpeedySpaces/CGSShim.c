@@ -80,7 +80,7 @@ bool sm_getWindowBounds(uint32_t wid, CGRect *outBounds) {
 // kinds. Used to VERIFY moves — the move calls return void and can silently no-op.
 typedef CFArrayRef (*CopySpacesForWindowsFn)(CGSConnectionID, uint32_t, CFArrayRef);
 
-CFArrayRef sm_copySpaceIDsForWindow(uint32_t wid) {
+CFArrayRef sm_copySpaceIDsForWindowMask(uint32_t wid, uint32_t mask) {
     static CopySpacesForWindowsFn fn = NULL; static int resolved = 0;
     if (!resolved) {
         fn = (CopySpacesForWindowsFn)dlsym(RTLD_DEFAULT, "CGSCopySpacesForWindows");
@@ -91,9 +91,13 @@ CFArrayRef sm_copySpaceIDsForWindow(uint32_t wid) {
     int64_t w = wid;
     CFNumberRef num = CFNumberCreate(NULL, kCFNumberSInt64Type, &w);
     CFArrayRef windows = CFArrayCreate(NULL, (const void **)&num, 1, &kCFTypeArrayCallBacks);
-    CFArrayRef spaces = fn(sm_mainConnectionID(), 0x7, windows);
+    CFArrayRef spaces = fn(sm_mainConnectionID(), mask, windows);
     CFRelease(windows); CFRelease(num);
     return spaces;
+}
+
+CFArrayRef sm_copySpaceIDsForWindow(uint32_t wid) {
+    return sm_copySpaceIDsForWindowMask(wid, 0x7);
 }
 
 // --- Switcher HUD sticky space ---------------------------------------------

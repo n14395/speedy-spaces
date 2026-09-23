@@ -1522,19 +1522,48 @@ final class MissionControlOverlay: NSObject {
     /// rescued them. That is the whole of the "still buggy while screen recording" report.
     /// A gap of 0 in there is two tiles reported at the same x — equally impossible.
     ///
-    /// So the test is now UNIFORMITY, not outlier-hunting: every gap within
-    /// `rowGapTolerance` of every other. Real rows pass with 1 pt of spread against 8 pt of
-    /// allowance; every straddled row above is out by 171 pt or more. The cost of a false
-    /// reject is one commit's delay, and the 0.3 s give-up in frame() bounds it.
+    /// So the test is UNIFORMITY, not outlier-hunting. But uniformity of WHAT: the rule was
+    /// "every gap within `rowGapTolerance` of every other", and that rejects a second kind
+    /// of row it should not — one that is missing a tile.
+    ///
+    /// **Measured 2026-09-23, from the user's third screen-recording report** ("fails to
+    /// finish animations, opening Mission Control and adding/removing workspaces"). Under a
+    /// recording every add and remove logged `ignoring a provisional relayout`, one to three
+    /// times each, including on commits whose own callbacks had supplied FRESH bounds for
+    /// every tracked tile (`commit geometry from 10/10 event callbacks` immediately above
+    /// the rejection). A fully-fresh row cannot be straddled — so the gap was not stale
+    /// geometry, it was a tile MISSING from the sample: on an add the eleventh tile exists
+    /// on screen but has not been adopted yet (it is adopted ~170 ms later, where the log
+    /// then says `desktop added`), so our row of ten has a hole exactly one pitch wide.
+    ///
+    /// A hole leaves gaps that are integer MULTIPLES of the pitch; a straddled sample leaves
+    /// fractions of it. That is the discriminator, and it separates every row shape ever
+    /// recorded here (the table above, all of which stay rejected, plus the hole row which
+    /// no longer is). So: take the pitch from the median gap and require every gap to be a
+    /// near-integer multiple of it, 1x to 4x.
+    ///
+    /// This matters because a refused row does not merely delay a retarget — `mustMap` is
+    /// false for that whole frame, so the labels are not told anything at all, and they
+    /// coast to wherever the PREVIOUS layout put them and stop there. Refusing one to three
+    /// commits of a 0.42 s native animation is exactly "the animation doesn't finish": the
+    /// captions land short, pause, and only catch up when a commit finally passes. The cost
+    /// of a false reject was never "one commit's delay" while a recording stretches the gap
+    /// between commits to ~1 s.
     static func rowIsCoherent(_ midXs: [CGFloat]) -> Bool {
         guard midXs.count >= 4 else { return true }
         let xs = midXs.sorted()
         var gaps: [CGFloat] = []
         for i in 1..<xs.count { gaps.append(xs[i] - xs[i - 1]) }
-        gaps.sort()
-        let median = gaps[gaps.count / 2]
-        guard median > 1 else { return true }
-        return (gaps.last! - gaps.first!) <= rowGapTolerance
+        let sorted = gaps.sorted()
+        let pitch = sorted[sorted.count / 2]
+        // Every tile reported at the same x: degenerate rather than wrong, and judged
+        // elsewhere. A row with SOME zero gaps is two tiles at one position — impossible.
+        guard pitch > 1 else { return sorted.last! <= 1 }
+        for g in gaps {
+            let k = (g / pitch).rounded()
+            guard k >= 1, k <= 4, abs(g - k * pitch) <= rowGapTolerance else { return false }
+        }
+        return true
     }
 
     /// How far a Mission Control row's tile gaps may differ from one another and still be a
@@ -1649,6 +1678,21 @@ final class MissionControlOverlay: NSObject {
         check(rowIsCoherent([100, 900]), "row: too few tiles to judge — accepted")
         check(rowIsCoherent([]), "row: empty — accepted")
         check(rowIsCoherent([500, 500, 500, 500]), "row: degenerate — accepted")
+        // A tile MISSING from the sample (an add's new tile before it is adopted) leaves one
+        // gap of exactly two pitches and nothing else wrong. That is a real row, and
+        // refusing it is what stopped the labels part-way through add/remove animations
+        // under a screen recording (2026-09-23). Gaps 171 x8 then 343.
+        check(rowIsCoherent([0, 171, 342, 514, 685, 856, 1027, 1198, 1369, 1712]),
+              "row: a real row with one tile missing from the sample is accepted")
+        check(rowIsCoherent([0, 171, 342, 855, 1026, 1197, 1368, 1539]),
+              "row: two adjacent tiles missing is still accepted")
+        // ...but a hole does NOT excuse a fractional gap elsewhere: same row, one tile also
+        // 86 pt out of place (the straddled shape change 7 was built to reject).
+        check(!rowIsCoherent([0, 171, 342, 514, 685, 856, 1027, 1113, 1370, 1713]),
+              "row: a hole plus a half-pitch outlier is still rejected")
+        // Two tiles reported at the same x, mixed with real gaps — impossible, still rejected.
+        check(!rowIsCoherent([0, 0, 171, 342, 342, 513, 684, 855]),
+              "row: duplicate positions rejected")
         // Tile -> screen grouping. A bar that opened scrolled pushes its far tile past the
         // screen edge; that tile is still the row's, or every label lands one space over.
         let one = [NSRect(x: 0, y: 0, width: 2056, height: 1329)]
@@ -2024,21 +2068,42 @@ final class MissionControlOverlay: NSObject {
         guard haveSample else { return }
         var s = lastSampleResult
         if !eventTiles.isEmpty {
-            var merged = 0
-            for i in s.tiles.indices where eventTiles[s.tiles[i].wid] != nil {
-                s.tiles[i].rect = eventTiles[s.tiles[i].wid]!
-                merged += 1
-            }
-            if merged > 0 {
+            // ALL OR NOTHING. Applying only the tiles the callbacks reached would leave the
+            // rest of the row at the positions of the PREVIOUS layout, and a row that is
+            // half new and half old is not a layout that was ever on screen — it is a
+            // straddle, and one we manufacture ourselves rather than one the window server
+            // handed us. `rowIsCoherent` then refuses it (correctly), `mustMap` goes false,
+            // and the labels are told nothing at all for that frame. Measured in the user's
+            // 2026-09-23 09:53 session: of four refused relayouts, THREE came from partial
+            // merges — `3/10`, `1/10` and `10/11` coverage produced
+            // `[171, 343, 87, 84, 342, 88, 83, 172, 430]`, `[171, 0, 343, …]` and
+            // `[171 x9, 85]`, all impossible rows. The half-pitch and zero gaps are the
+            // signature: two layouts interleaved.
+            //
+            // Discarding costs nothing, because the burst that delivered these callbacks
+            // ALSO asked the sampler for the whole row, carrying this commit's replay
+            // marking (see handleSLSEvent) and using the single-call `atomic` path when the
+            // server has just proved itself slow. That answer is internally consistent and
+            // landed 15-20 ms later in the same session. So the choice is not "fresh partial
+            // now vs complete later", it is "an impossible row now, which gets refused
+            // anyway, vs a real one in 15 ms".
+            //
+            // Complete coverage is the norm whenever the window server is healthy — every
+            // relayout in a normal session logs `10/10` — so this cannot fire outside the
+            // regime it was written for.
+            let covered = s.tiles.reduce(into: 0) { n, t in if eventTiles[t.wid] != nil { n += 1 } }
+            if covered == s.tiles.count, covered > 0 {
+                for i in s.tiles.indices { s.tiles[i].rect = eventTiles[s.tiles[i].wid]! }
                 s.tiles.sort { $0.rect.minX < $1.rect.minX }
                 lastSampleResult = s
                 if debugLog, replay {
-                    dbg("commit geometry from \(merged)/\(s.tiles.count) event callbacks"
-                        + " in \(Int(spent * 1_000_000)) µs"
-                        + (merged < s.tiles.count
-                           ? " — sampler owes \(s.tiles.count - merged)\(budgetHit ? " (budget)" : "")"
-                           : " — no round-trip wait"))
+                    dbg("commit geometry from \(covered)/\(s.tiles.count) event callbacks"
+                        + " in \(Int(spent * 1_000_000)) µs — no round-trip wait")
                 }
+            } else if debugLog, replay, covered > 0 {
+                dbg("commit geometry from only \(covered)/\(s.tiles.count) event callbacks"
+                    + " in \(Int(spent * 1_000_000)) µs\(budgetHit ? " (budget)" : "")"
+                    + " — DISCARDED, waiting for the sampler's whole-row answer")
             }
         }
         // Dismissal shows up as windows dying or leaving the on-screen list. Both now lag
@@ -2115,11 +2180,13 @@ final class MissionControlOverlay: NSObject {
         // matched replay spring so the labels play the same curve from the same instant.
         // Is this a layout worth replaying, or the window server's provisional one?
         var provisional = false
+        var rejectedRow: [CGFloat] = []
         if replay {
             // Same per-row grouping as the mapper, so a tile scrolled past the screen edge
             // is judged with its row rather than vanishing from it.
             for row in Self.tilesByScreen(s.tiles, frames: NSScreen.screens.map(\.frame)) {
-                if !Self.rowIsCoherent(row.map(\.rect.midX)) { provisional = true; break }
+                let xs = row.map(\.rect.midX)
+                if !Self.rowIsCoherent(xs) { provisional = true; rejectedRow = xs; break }
             }
         }
         if provisional {
@@ -2135,7 +2202,16 @@ final class MissionControlOverlay: NSObject {
                 provisionalSince = 0
                 dbg("provisional layouts persisted — accepting one rather than stalling")
             } else {
-                dbg("ignoring a provisional relayout — the row is not evenly spaced")
+                // Log the refused SHAPE, not just the fact: half-pitch gaps mean a row
+                // built from two layouts (the 2026-09-23 partial-callback bug), while
+                // integer multiples of the pitch mean a tile is merely missing.
+                let xs = rejectedRow.sorted()
+                var gaps: [Int] = []
+                for i in 1..<max(xs.count, 1) where xs.count >= 2 {
+                    gaps.append(Int((xs[i] - xs[i - 1]).rounded()))
+                }
+                dbg("ignoring a provisional relayout — the row is not evenly spaced:"
+                    + " \(xs.count) tiles, gaps \(gaps)")
             }
         } else {
             provisionalSince = 0
@@ -2202,6 +2278,10 @@ final class MissionControlOverlay: NSObject {
                 } else if w.needsMotion {
                     anyMoving = true
                 }
+                // While anything is in flight, commit a heartbeat so the window server
+                // re-rasterises this window — under Mission Control it does not do so on
+                // its own for a render-server animation (see OverlayWindow.heartbeat).
+                if w.heartbeat(now: now) { anyMoving = true }
             }
             for (did, w) in overlays where !active.contains(did) { w.update(labels: nil, now: now) }
         }
@@ -2544,25 +2624,8 @@ private enum MCLabelStickySpace {
             failed = true; HotkeyDiag.log("MC label sticky: attach symbol missing"); return
         }
         let t1 = CACurrentMediaTime()
-        // DIAGNOSTIC (2026-09-22 screen-recording investigation): the attach call returns
-        // before the window server has applied it. Until it has, the overlay still sits on
-        // the managed space, where Mission Control's shield composites OVER it — which is
-        // what dimmed, icon-less labels at open would look like. Poll membership so the
-        // log says when the window actually landed on the sticky space. Off-main on this
-        // serial queue; bounded.
-        var confirmedMs = -1
-        let deadline = t1 + 3.0
-        while CACurrentMediaTime() < deadline {
-            if let arr = sm_copySpaceIDsForWindow(wid) as? [NSNumber],
-               arr.count == 1, arr[0].uint64Value == spaceID {
-                confirmedMs = Int((CACurrentMediaTime() - askedAt) * 1000)
-                break
-            }
-            usleep(20_000)
-        }
-        HotkeyDiag.log("MC label sticky attach wid=\(wid): queued \(Int((t0 - askedAt) * 1000)) ms,"
-            + " call \(Int((t1 - t0) * 1000)) ms, on sticky space after "
-            + (confirmedMs >= 0 ? "\(confirmedMs) ms" : "NOT within 3 s"))
+        HotkeyDiag.log("MC label sticky attach wid=\(wid) -> space \(spaceID):"
+            + " queued \(Int((t0 - askedAt) * 1000)) ms, call \(Int((t1 - t0) * 1000)) ms")
     }
 }
 
@@ -2751,6 +2814,63 @@ private final class OverlayWindow: NSPanel {
     /// Whether any label still has distance to cover (drives the engine's settle logic).
     var needsMotion: Bool { items.values.contains { !$0.settled || $0.caDriven } }
 
+    // MARK: - Heartbeat
+
+    /// While Mission Control is open the window server re-rasterises this window ONLY
+    /// when we commit a transaction. A render-server animation — the relayout glides,
+    /// the reveal fade — keeps playing in the render server, and the display shows it
+    /// live, but the window's stored image stays at whatever the LAST commit rasterised.
+    /// Nothing else reads that image, until the screen is recorded: a recording (and a
+    /// screenshot) is composited from the stored images, so it shows the labels frozen
+    /// at the glide's first frame, or not at all after a reveal (the store was rasterised
+    /// at presentation alpha 0). That is the whole of the 2026-09-22/23 "labels freeze
+    /// under screen recording" report. Measured with probe/wincap + probe/layerprobe:
+    /// a bare window in this exact level/space configuration is re-rasterised live
+    /// until Mission Control opens, then not at all (27 changes in 747 captures) — with
+    /// a trivial commit every 16 ms it tracks throughout (697 of 744).
+    ///
+    /// So while anything is in flight, commit a real but invisible model change every
+    /// frame: the render server then rasterises the CURRENT presentation state, motion
+    /// included. Cheap (one 1×1 layer, ≤60 commits/s, only during motion), regime-blind
+    /// (no need to detect the recording), and it leaves the glides where they are.
+    private let pulse = CALayer()
+    private var pulseOn = false
+    private var pulseAt: CFTimeInterval = 0
+    /// Keep pulsing until here — covers fades whose progress is not ours to step.
+    private var pulseUntil: CFTimeInterval = 0
+    /// Cap the heartbeat well under a 120 Hz link: 60 commits/s is plenty for a capture.
+    private static let pulseSpacing: CFTimeInterval = 1.0 / 62
+
+    /// Pulse the render server if anything is moving or fading. Returns true while the
+    /// caller should keep the display link alive for it.
+    @discardableResult
+    func heartbeat(now: CFTimeInterval) -> Bool {
+        guard isVisible, needsMotion || now < pulseUntil else { return false }
+        if now - pulseAt >= Self.pulseSpacing {
+            pulseAt = now
+            if pulse.superlayer == nil, let host = container.layer {
+                pulse.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+                pulse.opacity = 0
+                host.addSublayer(pulse)
+            }
+            pulseOn.toggle()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            pulse.opacity = pulseOn ? 0.001 : 0   // a real model change, nothing to draw
+            CATransaction.commit()
+            // Nested inside AppKit's implicit transaction this would only decrement the
+            // nesting level; flush so the commit actually leaves for the render server.
+            CATransaction.flush()
+        }
+        return true
+    }
+
+    /// A fade of `duration` has just been committed: pulse through it and one beat past
+    /// its end, so the stored image ends on the settled state.
+    private func pulseThrough(_ duration: CFTimeInterval) {
+        pulseUntil = max(pulseUntil, CACurrentMediaTime() + duration + 0.1)
+    }
+
     /// Debug: every opacity in the chain that can make the labels render dim — the window,
     /// the container view and its layer (model vs what the render server is showing), and
     /// one representative label field. Chasing a "labels never reach full brightness"
@@ -2931,6 +3051,7 @@ private final class OverlayWindow: NSPanel {
             ctx.timingFunction = Self.fadeInCurve
             container.animator().alphaValue = 1
         }
+        pulseThrough(nativeExpandFade)
         if let report = Self.onAlpha {
             report("revealInPlace +0", alphaReport)
             for delay in [0.05, 0.2, 0.5, 1.5] {
@@ -3319,6 +3440,7 @@ private final class OverlayWindow: NSPanel {
         items.removeAll()
         fadeGen += 1
         let gen = fadeGen
+        pulseThrough(0.12)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.12
             container.animator().alphaValue = 0
@@ -3341,6 +3463,7 @@ private final class OverlayWindow: NSPanel {
         items.removeAll()
         fadeGen += 1
         let gen = fadeGen
+        pulseThrough(0.07)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.07
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
