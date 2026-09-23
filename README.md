@@ -6,7 +6,7 @@ macOS calls them "Desktop 1" through "Desktop 9" and gives you no way to tell th
 SpeedySpaces names them, puts those names in the menu bar and in Mission Control itself,
 and lets you jump between them with a hotkey, a gesture, or a click.
 
-![Custom names and icons on Mission Control's own thumbnails](docs/mission-control-labels.png)
+![Custom names and icons on Mission Control's own thumbnails](docs/01-mission-control-labels.png)
 
 ## Features
 
@@ -21,14 +21,14 @@ on the spot. Labels track Mission Control's own add, remove, and reorder animati
 one clickable segment per Space. Multi-display aware: follow the focused display, collapse
 the others, or hide single-Space displays.
 
-![Menu bar strip with per-space icons and the current space](docs/menu-bar.png)
+![Menu bar strip with per-space icons and the current space](docs/02-menu-bar-strip.png)
 
 **Switcher.** A wallpaper-thumbnail HUD that appears when you change Spaces or while you
 hold a key, in either a full-width Mission Control style or a compact popover. Click a
 tile to switch, drag tiles to reorder Spaces — including across displays. Add and remove
 desktops without opening Mission Control.
 
-![The workspace switcher popup](docs/switcher.png)
+![The workspace switcher popup](docs/04-switcher-hud.png)
 
 **Hotkeys.** Per-Space global hotkeys, a modifier-plus-number scheme, wrap-around
 stepping, and a Caps Lock hyper key. Send the focused window to another Space and follow

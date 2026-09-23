@@ -1542,6 +1542,49 @@ final class MissionControlOverlay: NSObject {
     /// straddled row observed is out by 86 pt. 8 pt sits far from both.
     static let rowGapTolerance: CGFloat = 8
 
+    /// Which screen's bar a sampled tile belongs to, as an index into `frames`
+    /// (nil when no screen shares its row).
+    ///
+    /// NOT "the screen whose frame contains the tile's centre". When Mission Control opens
+    /// with the cursor right of centre, the spaces bar opens with its row shifted the
+    /// other way, and with enough desktops the far tile sits partly or wholly past the
+    /// screen edge — its centre is on no screen at all. The old containment test dropped
+    /// that tile, and the positional pairing in mapLabels then shifted every label one
+    /// space over ("Home" over Desktop 2, 2026-09-23) until a mouse move slid the row
+    /// back and the counts agreed again. The window server still lists and samples a
+    /// tile pushed off the edge (verified: a window at x=-5000 is in the on-screen list
+    /// with kCGWindowIsOnscreen set), so nothing is missing but the grouping. A tile is
+    /// its row's wherever it slides, so one whose centre no screen contains goes to the
+    /// nearest screen that shares its vertical band; the overlay window is screen-sized,
+    /// so its label is simply clipped until the row scrolls it into view.
+    ///
+    /// Known limit: side-by-side displays whose bars share a band cannot be told apart by
+    /// geometry, so a tile scrolled off one display INTO its neighbour is grouped with the
+    /// neighbour — the same as before this rule; both displays then read as mismatched.
+    static func screenIndex(forTile r: NSRect, frames: [NSRect]) -> Int? {
+        let c = NSPoint(x: r.midX, y: r.midY)
+        if let i = frames.firstIndex(where: { $0.contains(c) }) { return i }
+        var best: (index: Int, distance: CGFloat)?
+        for (i, f) in frames.enumerated() where c.y >= f.minY && c.y < f.maxY {
+            let d = c.x < f.minX ? f.minX - c.x : (c.x > f.maxX ? c.x - f.maxX : 0)
+            if best == nil || d < best!.distance { best = (i, d) }
+        }
+        return best?.index
+    }
+
+    /// The sampled tiles grouped per screen (parallel to `NSScreen.screens`), each group
+    /// in x order. See `screenIndex(forTile:frames:)` for why a tile past the screen edge
+    /// still belongs to its row.
+    static func tilesByScreen(_ tiles: [(wid: CGWindowID, rect: NSRect)], frames: [NSRect])
+        -> [[(wid: CGWindowID, rect: NSRect)]] {
+        var out = [[(wid: CGWindowID, rect: NSRect)]](repeating: [], count: frames.count)
+        for t in tiles {
+            if let i = screenIndex(forTile: t.rect, frames: frames) { out[i].append(t) }
+        }
+        for i in out.indices { out[i].sort { $0.rect.minX < $1.rect.minX } }
+        return out
+    }
+
     private static func barBand(_ s: CGSize) -> Bool { s.width > 600 && s.height > 80 && s.height < 280 }
     private static func tileBand(_ s: CGSize) -> Bool { s.width > 100 && s.width < 320 && s.height > 90 && s.height < 200 }
 
@@ -1606,6 +1649,34 @@ final class MissionControlOverlay: NSObject {
         check(rowIsCoherent([100, 900]), "row: too few tiles to judge — accepted")
         check(rowIsCoherent([]), "row: empty — accepted")
         check(rowIsCoherent([500, 500, 500, 500]), "row: degenerate — accepted")
+        // Tile -> screen grouping. A bar that opened scrolled pushes its far tile past the
+        // screen edge; that tile is still the row's, or every label lands one space over.
+        let one = [NSRect(x: 0, y: 0, width: 2056, height: 1329)]
+        check(screenIndex(forTile: NSRect(x: 64, y: 65, width: 159, height: 121), frames: one) == 0,
+              "tile group: a tile inside the screen is the screen's")
+        check(screenIndex(forTile: NSRect(x: -120, y: 65, width: 159, height: 121), frames: one) == 0,
+              "tile group: a tile mostly past the left edge (centre off-screen) still counts")
+        check(screenIndex(forTile: NSRect(x: -400, y: 65, width: 159, height: 121), frames: one) == 0,
+              "tile group: a tile wholly past the left edge still counts")
+        check(screenIndex(forTile: NSRect(x: 2100, y: 65, width: 159, height: 121), frames: one) == 0,
+              "tile group: a tile wholly past the right edge still counts")
+        check(screenIndex(forTile: NSRect(x: 64, y: 2000, width: 159, height: 121), frames: one) == nil,
+              "tile group: a tile outside every row belongs to no screen")
+        let two = [NSRect(x: 0, y: 0, width: 2056, height: 1329),
+                   NSRect(x: 2056, y: 0, width: 1920, height: 1080)]
+        check(screenIndex(forTile: NSRect(x: 2100, y: 900, width: 159, height: 121), frames: two) == 1,
+              "tile group: two displays — a tile inside the second is the second's")
+        check(screenIndex(forTile: NSRect(x: 4000, y: 900, width: 159, height: 121), frames: two) == 1,
+              "tile group: two displays — past the far right edge goes to the nearest row")
+        check(screenIndex(forTile: NSRect(x: -400, y: 1200, width: 159, height: 121), frames: two) == 0,
+              "tile group: two displays — a band only the first display has stays with it")
+        let scrolled: [(wid: CGWindowID, rect: NSRect)] = [
+            (3, NSRect(x: 258, y: 65, width: 159, height: 121)),
+            (1, NSRect(x: -64, y: 65, width: 159, height: 121)),
+            (2, NSRect(x: 97, y: 65, width: 159, height: 121))]
+        let rows = tilesByScreen(scrolled, frames: one)
+        check(rows.count == 1 && rows[0].map(\.wid) == [1, 2, 3],
+              "tile group: a scrolled row keeps its off-edge tile, in x order")
         // Label centre <-> layer position. These two spaces differ by half the label
         // (an AppKit layer-backed view anchors at its frame origin), and confusing them
         // put the caption half a label off whenever a glide handed back to the spring.
@@ -2045,11 +2116,10 @@ final class MissionControlOverlay: NSObject {
         // Is this a layout worth replaying, or the window server's provisional one?
         var provisional = false
         if replay {
-            for screen in NSScreen.screens {
-                let sf = screen.frame
-                let xs = s.tiles.filter { sf.contains(CGPoint(x: $0.rect.midX, y: $0.rect.midY)) }
-                    .map(\.rect.midX)
-                if !Self.rowIsCoherent(xs) { provisional = true; break }
+            // Same per-row grouping as the mapper, so a tile scrolled past the screen edge
+            // is judged with its row rather than vanishing from it.
+            for row in Self.tilesByScreen(s.tiles, frames: NSScreen.screens.map(\.frame)) {
+                if !Self.rowIsCoherent(row.map(\.rect.midX)) { provisional = true; break }
             }
         }
         if provisional {
@@ -2216,14 +2286,18 @@ final class MissionControlOverlay: NSObject {
         // Prefs getters are CFPreferences reads (lock contention showed in the profile) —
         // read once per mapping, not once per tile.
         let namesVisible = Prefs.thumbnailNamesVisible
-        for screen in NSScreen.screens {
+        let screens = NSScreen.screens
+        // Grouped by row, not by which screen contains the tile: a tile the bar opened
+        // scrolled past the screen edge still counts for its display, or the positional
+        // pairing below is off by one (see `screenIndex(forTile:frames:)`).
+        let grouped = Self.tilesByScreen(tiles, frames: screens.map(\.frame))
+        for (si, screen) in screens.enumerated() {
             guard let did = screen.displayID else { continue }
             let sf = screen.frame
             guard bars.contains(where: { sf.contains(CGPoint(x: $0.midX, y: $0.midY)) }) else { continue }
             let scr = spacesByDisplay[did] ?? []
             guard !scr.isEmpty else { out.append((screen, [], false)); continue }
-            let t = tiles.filter { sf.contains(CGPoint(x: $0.rect.midX, y: $0.rect.midY)) }
-                .sorted { $0.rect.minX < $1.rect.minX }
+            let t = grouped[si]
             if t.count != scr.count {
                 mismatchSig += "\(did):\(t.count)/\(scr.count) "
                 if t.isEmpty { zeroTileBar = true } else { mismatchWithTiles = true }
@@ -2449,10 +2523,11 @@ private enum MCLabelStickySpace {
     static func park(_ window: NSWindow) {
         let wid = UInt32(max(0, window.windowNumber))
         guard wid > 0 else { return }
-        queue.async { attach(wid) }
+        let askedAt = CACurrentMediaTime()
+        queue.async { attach(wid, askedAt: askedAt) }
     }
 
-    private static func attach(_ wid: UInt32) {
+    private static func attach(_ wid: UInt32, askedAt: CFTimeInterval) {
         guard !failed else { return }
         if spaceID == 0 {
             guard sm_stickySpaceSymbolsAvailable() else {
@@ -2464,9 +2539,30 @@ private enum MCLabelStickySpace {
             }
             HotkeyDiag.log("MC label sticky space \(spaceID) @level \(CGShieldingWindowLevel())")
         }
+        let t0 = CACurrentMediaTime()
         if !sm_stickySpaceAttachWindow(wid, spaceID) {
-            failed = true; HotkeyDiag.log("MC label sticky: attach symbol missing")
+            failed = true; HotkeyDiag.log("MC label sticky: attach symbol missing"); return
         }
+        let t1 = CACurrentMediaTime()
+        // DIAGNOSTIC (2026-09-22 screen-recording investigation): the attach call returns
+        // before the window server has applied it. Until it has, the overlay still sits on
+        // the managed space, where Mission Control's shield composites OVER it — which is
+        // what dimmed, icon-less labels at open would look like. Poll membership so the
+        // log says when the window actually landed on the sticky space. Off-main on this
+        // serial queue; bounded.
+        var confirmedMs = -1
+        let deadline = t1 + 3.0
+        while CACurrentMediaTime() < deadline {
+            if let arr = sm_copySpaceIDsForWindow(wid) as? [NSNumber],
+               arr.count == 1, arr[0].uint64Value == spaceID {
+                confirmedMs = Int((CACurrentMediaTime() - askedAt) * 1000)
+                break
+            }
+            usleep(20_000)
+        }
+        HotkeyDiag.log("MC label sticky attach wid=\(wid): queued \(Int((t0 - askedAt) * 1000)) ms,"
+            + " call \(Int((t1 - t0) * 1000)) ms, on sticky space after "
+            + (confirmedMs >= 0 ? "\(confirmedMs) ms" : "NOT within 3 s"))
     }
 }
 
