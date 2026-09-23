@@ -2280,7 +2280,8 @@ final class MissionControlOverlay: NSObject {
                 }
                 // While anything is in flight, commit a heartbeat so the window server
                 // re-rasterises this window — under Mission Control it does not do so on
-                // its own for a render-server animation (see OverlayWindow.heartbeat).
+                // its own for a render-server animation, and a screen recording shows the
+                // stale image (see OverlayWindow.heartbeat).
                 if w.heartbeat(now: now) { anyMoving = true }
             }
             for (did, w) in overlays where !active.contains(did) { w.update(labels: nil, now: now) }
@@ -2843,11 +2844,16 @@ private final class OverlayWindow: NSPanel {
 
     /// Pulse the render server if anything is moving or fading. Returns true while the
     /// caller should keep the display link alive for it.
+    private var pulseCount = 0
+    private var pulseReportAt: CFTimeInterval = 0
+    private var pulseFlushMax: Double = 0
+
     @discardableResult
     func heartbeat(now: CFTimeInterval) -> Bool {
         guard isVisible, needsMotion || now < pulseUntil else { return false }
         if now - pulseAt >= Self.pulseSpacing {
             pulseAt = now
+            pulseCount += 1
             if pulse.superlayer == nil, let host = container.layer {
                 pulse.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
                 pulse.opacity = 0
@@ -2860,7 +2866,16 @@ private final class OverlayWindow: NSPanel {
             CATransaction.commit()
             // Nested inside AppKit's implicit transaction this would only decrement the
             // nesting level; flush so the commit actually leaves for the render server.
+            let f0 = CACurrentMediaTime()
             CATransaction.flush()
+            let flushMs = (CACurrentMediaTime() - f0) * 1000
+            pulseFlushMax = max(pulseFlushMax, flushMs)
+            // Debug trace: the flush is the one main-thread window-server round-trip this
+            // adds, so its cost is what to read if `frame gap` lines start following it.
+            if let trace = Self.onTrace, now - pulseReportAt >= 0.25 || flushMs > 20 {
+                pulseReportAt = now
+                trace("heartbeat: \(pulseCount) pulses, moving=\(needsMotion), fade \(max(0, Int((pulseUntil - now) * 1000))) ms left, flush \(Int(flushMs)) ms (max \(Int(pulseFlushMax)))")
+            }
         }
         return true
     }
