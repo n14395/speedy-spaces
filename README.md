@@ -1,4 +1,8 @@
-# SpeedySpaces
+<p align="center">
+  <img src="app-icon.png" width="160" height="160" alt="SpeedySpaces app icon">
+</p>
+
+<h1 align="center">SpeedySpaces</h1>
 
 A macOS menu bar app that gives your Spaces names, icons, and shortcuts.
 
