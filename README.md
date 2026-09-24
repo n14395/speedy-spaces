@@ -53,7 +53,13 @@ machines.
 ## Install
 
 SpeedySpaces uses private window-server APIs, so it can't ship on the Mac App Store.
-Download the notarized `.dmg` from [Releases](../../releases), or build it yourself.
+
+```sh
+brew tap n14395/tap
+brew install --cask speedy-spaces
+```
+
+Or download the notarized `.dmg` from [Releases](../../releases) — or build it yourself.
 
 ## Requirements
 
