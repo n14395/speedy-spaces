@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// Compact chooser for the workspace list's default icon, hosted in an NSPopover from

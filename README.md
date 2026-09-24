@@ -130,4 +130,5 @@ Source lives in `Sources/SpeedySpaces/`, one concern per file: `SpacesManager`
 
 ## License
 
-All rights reserved. Not yet licensed for redistribution.
+Licensed under the [Apache License, Version 2.0](LICENSE).
+Third-party attribution is in [NOTICE](NOTICE).

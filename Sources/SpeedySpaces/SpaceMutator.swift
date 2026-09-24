@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// Adds and removes desktops by driving Mission Control's own controls with synthetic

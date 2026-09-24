@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// A small borderless floating panel that behaves like a native tooltip but can show an icon

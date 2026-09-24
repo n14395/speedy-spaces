@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// Per-space wallpaper source for the switcher HUD. Primary source is macOS's own

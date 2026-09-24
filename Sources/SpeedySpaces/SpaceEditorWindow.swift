@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// A small AppKit panel for editing a space's name and icon. For SF Symbols it shows a

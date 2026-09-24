@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// Watches the user's REAL macOS Spaces shortcuts (com.apple.symbolichotkeys ids 79/81 =

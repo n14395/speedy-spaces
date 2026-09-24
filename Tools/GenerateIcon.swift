@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 // Renders SpeedySpaces's app icon programmatically and writes an .iconset of PNGs.
 // Usage: swift GenerateIcon.swift <output-iconset-dir>
 // Then: iconutil -c icns <output-iconset-dir> -o AppIcon.icns

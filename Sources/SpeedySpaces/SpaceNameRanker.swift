@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// Shared name-match ranking for user-typed space queries: exact beats prefix beats

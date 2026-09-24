@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// A self-contained SF Symbol picker: a search field over a scrollable grid of symbols.

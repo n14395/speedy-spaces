@@ -1,3 +1,6 @@
+// Copyright 2026 Nick Fay
+// SPDX-License-Identifier: Apache-2.0
+
 import AppKit
 
 /// Renders a space's assigned icon (SF Symbol or emoji) to an NSImage for use
