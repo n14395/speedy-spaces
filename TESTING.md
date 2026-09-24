@@ -29,7 +29,7 @@ plus a `TOTAL:` line.
 ### How the live tier works (and its assumptions)
 
 - Synthetic **keyboard** events are dropped system-wide on this machine, so shortcut
-  dispatch is tested through `--fire-hotkey <actionId>` (the `com.speedyspaces.debug.hotkey`
+  dispatch is tested through `--fire-hotkey <actionId>` (the `com.n14395.SpeedySpaces.debug.hotkey`
   side door) instead of real key presses.
 - Directional commands act on the display **under the pointer**; the runner parks the
   pointer at (100, 100) on the primary display before every directional action. Moving

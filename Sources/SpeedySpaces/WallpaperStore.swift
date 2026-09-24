@@ -20,7 +20,7 @@ final class WallpaperStore {
     private(set) var paths: [String: String]
     private let fileURL: URL
     private let thumbnails = NSCache<NSString, NSImage>()
-    private let loadQueue = DispatchQueue(label: "com.speedyspaces.wallpaper", qos: .utility)
+    private let loadQueue = DispatchQueue(label: "com.n14395.SpeedySpaces.wallpaper", qos: .utility)
     private var recordScheduled = false
 
     /// Redraw hook: fired on main after an async thumbnail load completes.

@@ -4,7 +4,7 @@
 # Line Tools, and the App Intents metadata step needs Xcode's toolchain.
 name: SpeedySpaces
 options:
-  bundleIdPrefix: com.speedyspaces
+  bundleIdPrefix: com.n14395
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -29,7 +29,7 @@ targets:
       - path: Resources/AppIcon.icns
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.speedyspaces.SpeedySpaces
+        PRODUCT_BUNDLE_IDENTIFIER: com.n14395.SpeedySpaces
         INFOPLIST_FILE: Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: SpeedySpaces.entitlements
         SWIFT_OBJC_BRIDGING_HEADER: Sources/SpeedySpaces/CGSPrivate.h

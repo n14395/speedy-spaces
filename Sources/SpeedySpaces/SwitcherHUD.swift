@@ -194,7 +194,7 @@ final class SwitcherHUD {
         // so headless verification drives the HUD through distributed notifications.
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(debugCommand(_:)),
-            name: Notification.Name("com.speedyspaces.debug.switcher"), object: nil)
+            name: Notification.Name("com.n14395.SpeedySpaces.debug.switcher"), object: nil)
     }
 
     deinit {

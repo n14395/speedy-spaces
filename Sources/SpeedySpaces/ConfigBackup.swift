@@ -11,7 +11,7 @@ import AppKit
 /// self-healing. A `schemaVersion` guards future format changes; none existed before.
 enum ConfigBackup {
     static let schemaVersion = 1
-    private static let defaultsDomain = "com.speedyspaces.SpeedySpaces"
+    private static let defaultsDomain = "com.n14395.SpeedySpaces"
 
     struct ImportSummary { var applied = 0; var remapped = 0; var unmatched = 0 }
 

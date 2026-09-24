@@ -17,7 +17,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/build/SpeedySpaces.app"
 BIN="$APP/Contents/MacOS/SpeedySpaces"
 DIAG=/tmp/speedyspaces-hotkey-diag.log
-DOMAIN=com.speedyspaces.SpeedySpaces
+DOMAIN=com.n14395.SpeedySpaces
 TMP="$(mktemp -d /tmp/speedyspaces-tests.XXXXXX)"
 PASS=0; FAIL=0; TIER=""; MARK=0
 

@@ -331,7 +331,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.speedyspaces.SpeedySpaces;
+				PRODUCT_BUNDLE_IDENTIFIER = com.n14395.SpeedySpaces;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = Sources/SpeedySpaces/CGSPrivate.h;
 			};
@@ -349,7 +349,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.speedyspaces.SpeedySpaces;
+				PRODUCT_BUNDLE_IDENTIFIER = com.n14395.SpeedySpaces;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = Sources/SpeedySpaces/CGSPrivate.h;
 			};

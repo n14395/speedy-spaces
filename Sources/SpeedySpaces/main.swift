@@ -1050,7 +1050,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--fire-hotkey") {
         exit(2)
     }
     DistributedNotificationCenter.default().postNotificationName(
-        Notification.Name("com.speedyspaces.debug.hotkey"),
+        Notification.Name("com.n14395.SpeedySpaces.debug.hotkey"),
         object: CommandLine.arguments[i + 1], userInfo: nil, deliverImmediately: true)
     print("fired \(CommandLine.arguments[i + 1])")
     exit(0)
@@ -1058,11 +1058,11 @@ if let i = CommandLine.arguments.firstIndex(of: "--fire-hotkey") {
 
 // Scriptability: drive the RUNNING instance from the shell. These mirror the
 // `speedyspaces://` URL scheme and feed the same command router (HotkeyManager.runCommand).
-// Each is a throwaway process that posts `com.speedyspaces.command` and exits before
+// Each is a throwaway process that posts `com.n14395.SpeedySpaces.command` and exits before
 // NSApplication is created, so it never trips terminateOtherInstances.
 func sm_postCommand(_ command: String) -> Never {
     DistributedNotificationCenter.default().postNotificationName(
-        Notification.Name("com.speedyspaces.command"),
+        Notification.Name("com.n14395.SpeedySpaces.command"),
         object: command, userInfo: nil, deliverImmediately: true)
     print("sent \(command)")
     exit(0)
@@ -1097,7 +1097,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--switcher-debug") {
         exit(2)
     }
     DistributedNotificationCenter.default().postNotificationName(
-        Notification.Name("com.speedyspaces.debug.switcher"),
+        Notification.Name("com.n14395.SpeedySpaces.debug.switcher"),
         object: CommandLine.arguments[i + 1], userInfo: nil, deliverImmediately: true)
     print("sent \(CommandLine.arguments[i + 1])")
     exit(0)
@@ -1109,7 +1109,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--show-switcher") {
     let seconds = i + 1 < CommandLine.arguments.count
         ? (Double(CommandLine.arguments[i + 1]) ?? 3) : 3
     DistributedNotificationCenter.default().postNotificationName(
-        Notification.Name("com.speedyspaces.debug.switcher"),
+        Notification.Name("com.n14395.SpeedySpaces.debug.switcher"),
         object: "show:\(seconds)", userInfo: nil, deliverImmediately: true)
     print("switcher shown for \(seconds)s")
     exit(0)

@@ -6,7 +6,7 @@ import Carbon.HIToolbox
 
 /// Opt-in file trace for hotkey delivery — this app's NSLog lines do not surface in
 /// `log stream` on some systems, which makes registration/dispatch otherwise
-/// unobservable. Enable with `defaults write com.speedyspaces.SpeedySpaces hotkeyDebugLog
+/// unobservable. Enable with `defaults write com.n14395.SpeedySpaces hotkeyDebugLog
 /// -bool true` (and relaunch); lines append to /tmp/speedyspaces-hotkey-diag.log.
 enum HotkeyDiag {
     /// Writes are handed to this serial queue and NEVER performed inline: several call
@@ -115,13 +115,13 @@ final class HotkeyManager {
         // dispatch layer needs this side door; real keypresses use the Carbon path.
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(debugFire(_:)),
-            name: Notification.Name("com.speedyspaces.debug.hotkey"), object: nil)
+            name: Notification.Name("com.n14395.SpeedySpaces.debug.hotkey"), object: nil)
         // Shipping command side door: the `speedyspaces://` URL scheme, the CLI switch
         // flags, and the App Intents (Shortcuts) all funnel a canonical command string
         // here — see runCommand(_:). Kept out of the `.debug.` namespace on purpose.
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(externalCommand(_:)),
-            name: Notification.Name("com.speedyspaces.command"), object: nil)
+            name: Notification.Name("com.n14395.SpeedySpaces.command"), object: nil)
     }
 
     @objc private func externalCommand(_ note: Notification) {
@@ -148,7 +148,7 @@ final class HotkeyManager {
         case "rename":          perform(.renameCurrentSpace)
         case "switcher":
             DistributedNotificationCenter.default().postNotificationName(
-                Notification.Name("com.speedyspaces.debug.switcher"),
+                Notification.Name("com.n14395.SpeedySpaces.debug.switcher"),
                 object: "show:1.5", userInfo: nil, deliverImmediately: true)
         default:
             if command.hasPrefix("switch:uuid:") {

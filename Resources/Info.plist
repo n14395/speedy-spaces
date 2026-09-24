@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>SpeedySpaces</string>
     <key>CFBundleIdentifier</key>
-    <string>com.speedyspaces.SpeedySpaces</string>
+    <string>com.n14395.SpeedySpaces</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
@@ -30,7 +30,7 @@
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>com.speedyspaces.SpeedySpaces</string>
+            <string>com.n14395.SpeedySpaces</string>
             <key>CFBundleURLSchemes</key>
             <array>
                 <string>speedyspaces</string>

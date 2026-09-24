@@ -47,7 +47,7 @@ enum WindowMover {
         guard peerObservers.isEmpty else { return }
         let center = DistributedNotificationCenter.default()
         let began = center.addObserver(
-            forName: Notification.Name("dev.nwf.MoreCorners.windowMoveBegan"),
+            forName: Notification.Name("com.n14395.MoreCorners.windowMoveBegan"),
             object: nil, queue: .main) { _ in
             externalMoveInFlight = true
             peerClearWork?.cancel()
@@ -56,7 +56,7 @@ enum WindowMover {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
         }
         let ended = center.addObserver(
-            forName: Notification.Name("dev.nwf.MoreCorners.windowMoveEnded"),
+            forName: Notification.Name("com.n14395.MoreCorners.windowMoveEnded"),
             object: nil, queue: .main) { _ in
             peerClearWork?.cancel(); peerClearWork = nil
             externalMoveInFlight = false

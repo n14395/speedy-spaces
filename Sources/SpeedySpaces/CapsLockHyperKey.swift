@@ -66,7 +66,7 @@ final class CapsLockHyper {
     private var syncedEnabled: Bool?
     private var warnedNoAX = false
     /// Serial: keeps an enable-then-disable toggle burst ordered.
-    private let hidQueue = DispatchQueue(label: "com.speedyspaces.capshyper.hidutil")
+    private let hidQueue = DispatchQueue(label: "com.n14395.SpeedySpaces.capshyper.hidutil")
 
     /// Converge on the pref. Called at launch and on every prefs change; idempotent.
     func apply() {
